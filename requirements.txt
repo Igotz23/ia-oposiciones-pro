@@ -1,4 +1,19 @@
-streamlit
-langchain-groq
-pypdf
-python-dotenv
+# ============================================
+# IA Oposiciones Pro - Dependencias
+# ============================================
+
+# Framework web
+streamlit>=1.28.0
+
+# Cliente de IA (Groq)
+groq>=0.4.0
+
+# Procesamiento de PDFs
+pypdf>=4.0.0
+pdf2image>=1.16.0
+
+# Manipulación de imágenes
+Pillow>=10.0.0
+
+# Variables de entorno
+python-dotenv>=1.0.0
