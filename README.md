@@ -216,7 +216,7 @@ ia-oposiciones-pro/
 │
 ├── app.py                  # Aplicación principal (Streamlit)
 ├── requirements.txt        # Dependencias de Python
-├── .env                    # Variables de entorno (no subir a GitHub)
+├── .env                    # Variables de entorno 
 ├── .env.example            # Ejemplo de variables de entorno
 ├── .gitignore              # Archivos ignorados por Git
 └── README.md               # Este archivo
