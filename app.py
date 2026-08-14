@@ -90,6 +90,42 @@ def cargar_de_cache(hash_id, sufijo):
             return None
     return None
 
+def _normalizar_opciones(opciones):
+    """Garantiza que 'opciones' termine siendo una lista de dicts {'letra':..,'texto':..},
+    sin importar si Supabase/JSON las devuelve como string, string doblemente
+    serializado, o con elementos individuales serializados como string."""
+    # Paso 1: si el conjunto entero llegó como string, parsear (una o dos veces si hace falta)
+    intentos = 0
+    while isinstance(opciones, str) and intentos < 3:
+        try:
+            opciones = json.loads(opciones)
+        except (json.JSONDecodeError, TypeError):
+            break
+        intentos += 1
+
+    # Paso 2: si el conjunto llegó como dict tipo {"a": "texto a", "b": "texto b", ...},
+    # lo convertimos a la lista de dicts {'letra':..,'texto':..} que espera el resto de la app.
+    if isinstance(opciones, dict):
+        opciones = [{"letra": letra, "texto": texto} for letra, texto in opciones.items()]
+
+    if not isinstance(opciones, list):
+        return []
+
+    # Paso 3: normalizar cada elemento individual
+    normalizadas = []
+    for opt in opciones:
+        if isinstance(opt, str):
+            try:
+                opt = json.loads(opt)
+            except (json.JSONDecodeError, TypeError):
+                continue
+        if isinstance(opt, dict) and "letra" in opt and "texto" in opt:
+            normalizadas.append(opt)
+    # Aseguramos orden alfabético estable por letra (a, b, c, d...)
+    normalizadas.sort(key=lambda o: str(o.get("letra", "")))
+    return normalizadas
+
+
 # --- FUNCIONES AUXILIARES DE SUPABASE ---
 def subir_preguntas_a_supabase(nombre_tabla, preguntas, hash_id, nombre_archivo):
     """Sube las preguntas extraídas de un PDF nuevo a la tabla elegida de Supabase.
@@ -97,16 +133,16 @@ def subir_preguntas_a_supabase(nombre_tabla, preguntas, hash_id, nombre_archivo)
     if supabase_client is None:
         return False, "Supabase no está configurado (faltan SUPABASE_URL / SUPABASE_KEY en el .env)."
     try:
-        filas = [
-            {
+        filas = []
+        for p in preguntas:
+            opciones = _normalizar_opciones(p.get("opciones"))
+            filas.append({
                 "numero": p.get("numero"),
                 "pregunta": p.get("pregunta"),
-                "opciones": p.get("opciones"),
+                "opciones": opciones,
                 "examen_hash": hash_id,
                 "nombre_archivo": nombre_archivo,
-            }
-            for p in preguntas
-        ]
+            })
         supabase_client.table(nombre_tabla).upsert(filas, on_conflict="examen_hash,numero").execute()
         return True, f"{len(filas)} preguntas subidas a '{nombre_tabla}'."
     except Exception as e:
@@ -120,7 +156,11 @@ def cargar_preguntas_desde_supabase(nombre_tabla):
     try:
         respuesta = supabase_client.table(nombre_tabla).select("numero, pregunta, opciones").order("numero").execute()
         preguntas = [
-            {"numero": fila["numero"], "pregunta": fila["pregunta"], "opciones": fila["opciones"]}
+            {
+                "numero": fila["numero"],
+                "pregunta": fila["pregunta"],
+                "opciones": _normalizar_opciones(fila["opciones"]),
+            }
             for fila in respuesta.data
         ]
         return preguntas, None
@@ -576,12 +616,16 @@ with tab1:
             st.markdown("---")
             st.markdown(f"**Pregunta {num}:** {item['pregunta']}")
             
-            opciones = [f"{opt['letra'].upper()}) {opt['texto']}" for opt in item["opciones"]]
+            opciones_item = _normalizar_opciones(item.get("opciones"))
+            if not opciones_item:
+                st.warning(f"⚠️ La pregunta {num} no tiene opciones válidas y se omite.")
+                continue
+            opciones = [f"{opt['letra'].upper()}) {opt['texto']}" for opt in opciones_item]
             
             index_previo = None
             if num in st.session_state.respuestas_usuario:
                 letra_g = st.session_state.respuestas_usuario[num]
-                for i, opt in enumerate(item["opciones"]):
+                for i, opt in enumerate(opciones_item):
                     if opt["letra"] == letra_g:
                         index_previo = i
             
