@@ -4,6 +4,7 @@ import os
 import base64
 import re
 import time
+import random
 from io import BytesIO
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
@@ -31,7 +32,7 @@ if SUPABASE_DISPONIBLE and os.environ.get("SUPABASE_URL") and os.environ.get("SU
 TABLAS_SUPABASE_DISPONIBLES = [
     "Aplicaciones_teorica_Parte1",
     "Aplicaciones_teorica_Parte2",
-    "Sistemas_practicas",
+    "Sistemas_practica",
     "Sistemas_teorica"
 ]
 
@@ -60,112 +61,80 @@ def groq_completion_con_reintentos(client, max_reintentos=5, **kwargs):
             st.toast(f"⏳ Límite de velocidad alcanzado, reintentando en {espera:.1f}s...")
             time.sleep(espera + 0.3)
 
-# --- CACHÉ EN DISCO: EVITA VOLVER A GASTAR TOKENS EN UN PDF YA PROCESADO ---
-import hashlib
 
-CARPETA_CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache_examenes")
-os.makedirs(CARPETA_CACHE, exist_ok=True)
+def parsear_seleccion_preguntas(texto_seleccion, numeros_disponibles):
+    """Parsea un texto tipo '200-300 450 460' en un conjunto de números de pregunta.
+    Se puede seleccionar por rango (con guión) o individualmente (separado por espacios).
+    Si el texto está vacío, se seleccionan todas las preguntas disponibles."""
+    texto = (texto_seleccion or "").strip()
+    disponibles = set(numeros_disponibles)
 
-def hash_archivo(bytes_archivo):
-    """Genera un identificador único a partir del contenido del archivo (no cambia aunque lo renombres)."""
-    return hashlib.sha256(bytes_archivo).hexdigest()
+    if not texto:
+        return disponibles
 
-def ruta_cache(hash_id, sufijo):
-    return os.path.join(CARPETA_CACHE, f"{hash_id}_{sufijo}.json")
+    seleccionados = set()
+    for token in texto.split():
+        token = token.strip()
+        if "-" in token:
+            partes = token.split("-")
+            if len(partes) == 2 and partes[0].strip().lstrip("-").isdigit() and partes[1].strip().isdigit():
+                inicio, fin = int(partes[0]), int(partes[1])
+                if inicio > fin:
+                    inicio, fin = fin, inicio
+                seleccionados.update(range(inicio, fin + 1))
+        elif token.isdigit():
+            seleccionados.add(int(token))
 
-def guardar_en_cache(hash_id, sufijo, datos):
-    try:
-        with open(ruta_cache(hash_id, sufijo), "w", encoding="utf-8") as f:
-            json.dump(datos, f, ensure_ascii=False)
-    except Exception:
-        pass  # la caché es un extra, si falla no debe romper la app
-
-def cargar_de_cache(hash_id, sufijo):
-    ruta = ruta_cache(hash_id, sufijo)
-    if os.path.exists(ruta):
-        try:
-            with open(ruta, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            return None
-    return None
-
-def _normalizar_opciones(opciones):
-    """Garantiza que 'opciones' termine siendo una lista de dicts {'letra':..,'texto':..},
-    sin importar si Supabase/JSON las devuelve como string, string doblemente
-    serializado, o con elementos individuales serializados como string."""
-    # Paso 1: si el conjunto entero llegó como string, parsear (una o dos veces si hace falta)
-    intentos = 0
-    while isinstance(opciones, str) and intentos < 3:
-        try:
-            opciones = json.loads(opciones)
-        except (json.JSONDecodeError, TypeError):
-            break
-        intentos += 1
-
-    # Paso 2: si el conjunto llegó como dict tipo {"a": "texto a", "b": "texto b", ...},
-    # lo convertimos a la lista de dicts {'letra':..,'texto':..} que espera el resto de la app.
-    if isinstance(opciones, dict):
-        opciones = [{"letra": letra, "texto": texto} for letra, texto in opciones.items()]
-
-    if not isinstance(opciones, list):
-        return []
-
-    # Paso 3: normalizar cada elemento individual
-    normalizadas = []
-    for opt in opciones:
-        if isinstance(opt, str):
-            try:
-                opt = json.loads(opt)
-            except (json.JSONDecodeError, TypeError):
-                continue
-        if isinstance(opt, dict) and "letra" in opt and "texto" in opt:
-            normalizadas.append(opt)
-    # Aseguramos orden alfabético estable por letra (a, b, c, d...)
-    normalizadas.sort(key=lambda o: str(o.get("letra", "")))
-    return normalizadas
+    return seleccionados & disponibles
 
 
-# --- FUNCIONES AUXILIARES DE SUPABASE ---
-def subir_preguntas_a_supabase(nombre_tabla, preguntas, hash_id, nombre_archivo):
-    """Sube las preguntas extraídas de un PDF nuevo a la tabla elegida de Supabase.
-    Usa upsert por (examen_hash, numero) para no duplicar si se repite el envío."""
+def cargar_preguntas_desde_supabase(nombre_tabla, seleccion_texto="", orden="Orden numérico"):
+    """Recupera las preguntas guardadas en una tabla de Supabase, incluyendo la respuesta
+    correcta (columna 'respuesta') para poder corregir sin subir una plantilla aparte.
+    Permite filtrar por número de pregunta (rangos o individuales) y elegir el orden
+    de presentación: numérico, aleatorio, o aleatorio con las opciones también desordenadas."""
     if supabase_client is None:
-        return False, "Supabase no está configurado (faltan SUPABASE_URL / SUPABASE_KEY en el .env)."
+        return None, None, "Supabase no está configurado."
     try:
-        filas = []
-        for p in preguntas:
-            opciones = _normalizar_opciones(p.get("opciones"))
-            filas.append({
-                "numero": p.get("numero"),
-                "pregunta": p.get("pregunta"),
-                "opciones": opciones,
-                "examen_hash": hash_id,
-                "nombre_archivo": nombre_archivo,
-            })
-        supabase_client.table(nombre_tabla).upsert(filas, on_conflict="examen_hash,numero").execute()
-        return True, f"{len(filas)} preguntas subidas a '{nombre_tabla}'."
-    except Exception as e:
-        return False, f"No se pudo subir a Supabase: {e}"
+        respuesta = supabase_client.table(nombre_tabla).select("numero, pregunta, opciones, respuesta").order("numero").execute()
+        filas = respuesta.data
+        if not filas:
+            return [], {}, None
 
+        numeros_disponibles = [fila["numero"] for fila in filas if fila.get("numero") is not None]
+        numeros_seleccionados = parsear_seleccion_preguntas(seleccion_texto, numeros_disponibles)
+        filas_filtradas = [fila for fila in filas if fila.get("numero") in numeros_seleccionados]
 
-def cargar_preguntas_desde_supabase(nombre_tabla):
-    """Recupera todas las preguntas guardadas en una tabla de Supabase, ordenadas por número."""
-    if supabase_client is None:
-        return None, "Supabase no está configurado."
-    try:
-        respuesta = supabase_client.table(nombre_tabla).select("numero, pregunta, opciones").order("numero").execute()
-        preguntas = [
-            {
+        preguntas = []
+        plantilla_respuestas = {}
+        for fila in filas_filtradas:
+            opciones = fila.get("opciones")
+            # Compatibilidad: si las opciones vinieran como objeto {"a": "..."} en vez de lista, las normalizamos
+            if isinstance(opciones, dict):
+                opciones = [{"letra": letra, "texto": texto_opt} for letra, texto_opt in opciones.items()]
+
+            preguntas.append({
                 "numero": fila["numero"],
                 "pregunta": fila["pregunta"],
-                "opciones": _normalizar_opciones(fila["opciones"]),
-            }
-            for fila in respuesta.data
-        ]
-        return preguntas, None
+                "opciones": opciones,
+            })
+
+            if fila.get("respuesta"):
+                plantilla_respuestas[str(fila["numero"])] = str(fila["respuesta"]).lower().strip()
+
+        if orden == "Orden numérico":
+            preguntas.sort(key=lambda p: p["numero"])
+        elif orden == "Orden aleatorio":
+            random.shuffle(preguntas)
+        elif orden == "Orden aleatorio y respuestas desordenadas":
+            random.shuffle(preguntas)
+            for p in preguntas:
+                if isinstance(p["opciones"], list):
+                    random.shuffle(p["opciones"])
+
+        return preguntas, plantilla_respuestas, None
     except Exception as e:
-        return None, f"No se pudo leer de Supabase: {e}"
+        return None, None, f"No se pudo leer de Supabase: {e}"
 
 st.set_page_config(page_title="IA Oposiciones - Escaneados Pro", layout="wide")
 st.title("🛡️ Sistema Inteligente de Exámenes (Soporta PDFs Escaneados)")
@@ -227,18 +196,48 @@ with st.sidebar:
         key="tabla_supabase_actual",
         help="Cada tabla guarda las preguntas de un temario o parte distinta del examen."
     )
+
+    st.markdown("**Selecciona las preguntas:**")
+    st.caption(
+        "Se puede seleccionar temas y preguntas mediante rango (con un guión) o individualmente "
+        "por espacios como se muestra en el ejemplo. Si se dejan en blanco se seleccionan todas las preguntas."
+    )
+    seleccion_preguntas_texto = st.text_input(
+        "Preguntas:",
+        placeholder="Ejemplo: 200-300 450 460",
+        key="seleccion_preguntas_texto"
+    )
+
+    st.markdown("**Selecciona el orden:**")
+    orden_preguntas = st.radio(
+        "orden_preguntas",
+        options=["Orden numérico", "Orden aleatorio", "Orden aleatorio y respuestas desordenadas"],
+        key="orden_preguntas_radio",
+        label_visibility="collapsed"
+    )
+
     if supabase_client is not None and st.button("☁️ Cargar preguntas guardadas de esta tabla"):
         with st.spinner(f"Consultando '{tabla_seleccionada}' en Supabase..."):
-            preguntas_supabase, error_supabase = cargar_preguntas_desde_supabase(tabla_seleccionada)
+            preguntas_supabase, plantilla_supabase, error_supabase = cargar_preguntas_desde_supabase(
+                tabla_seleccionada, seleccion_preguntas_texto, orden_preguntas
+            )
             if error_supabase:
                 st.error(error_supabase)
             elif preguntas_supabase:
                 st.session_state.preguntas_examen = preguntas_supabase
                 st.session_state.respuestas_usuario = {}
                 st.session_state.corregido = False
-                st.success(f"✅ Cargadas {len(preguntas_supabase)} preguntas desde Supabase.")
+                # ✅ Comparamos directamente contra la respuesta guardada en la BD, sin necesidad
+                # de subir una plantilla de respuestas aparte.
+                st.session_state.plantilla_respuestas = plantilla_supabase
+                mensaje = f"✅ Cargadas {len(preguntas_supabase)} preguntas desde Supabase"
+                if plantilla_supabase:
+                    mensaje += f" (con {len(plantilla_supabase)} respuestas correctas listas para corregir)."
+                else:
+                    mensaje += " (esta tabla no tiene respuestas correctas guardadas)."
+                st.success(mensaje)
             else:
-                st.warning("Esa tabla todavía no tiene preguntas guardadas.")
+                st.warning("No hay preguntas que coincidan con esa selección en esta tabla.")
 
     st.header("📥 Carga del Examen")
     uploaded_file = st.file_uploader("Sube el PDF del examen (Digital o Escaneado)", type="pdf")
@@ -253,18 +252,6 @@ with st.sidebar:
         with st.spinner("Leyendo archivo de respuestas..."):
             try:
                 resp_bytes = uploaded_respuestas.read()
-                hash_id_resp = hash_archivo(resp_bytes)
-                cache_respuestas = cargar_de_cache(hash_id_resp, "respuestas")
-
-                if cache_respuestas is not None:
-                    st.session_state.texto_respuestas = cache_respuestas["texto_respuestas"]
-                    st.session_state.plantilla_respuestas = cache_respuestas["plantilla"]
-                    st.success(
-                        f"⚡ Respuestas cargadas desde caché local (0 tokens gastados): "
-                        f"{len(cache_respuestas['plantilla'])} preguntas"
-                    )
-                    st.stop()
-
                 texto_respuestas = ""
                 
                 # Si es PDF, intentar extraer texto primero
@@ -322,11 +309,6 @@ with st.sidebar:
                         plantilla = json.loads(json_match.group())
                         st.session_state.plantilla_respuestas = {str(k): str(v).lower().strip() for k, v in plantilla.items()}
                         st.success(f"✅ Respuestas cargadas: {len(st.session_state.plantilla_respuestas)} preguntas")
-                        # Guardamos en caché para no volver a gastar tokens con este mismo archivo
-                        guardar_en_cache(hash_id_resp, "respuestas", {
-                            "texto_respuestas": texto_respuestas,
-                            "plantilla": st.session_state.plantilla_respuestas
-                        })
                     except json.JSONDecodeError:
                         st.warning("⚠️ No se pudo parsear el JSON. Revisa la pestaña de diagnóstico.")
                 else:
@@ -343,21 +325,7 @@ with st.sidebar:
     if uploaded_file is not None and st.button("🚀 Procesar Examen"):
         with st.spinner("Analizando documento..."):
             try:
-                # 0. Comprobar si este PDF ya se procesó antes (mismo contenido exacto) para no gastar tokens de nuevo
                 file_bytes = uploaded_file.read()
-                hash_id = hash_archivo(file_bytes)
-                resultado_cacheado = cargar_de_cache(hash_id, "resultado")
-
-                if resultado_cacheado is not None:
-                    st.session_state.texto_examen = resultado_cacheado["texto_examen"]
-                    st.session_state.preguntas_examen = resultado_cacheado["preguntas"]
-                    st.session_state.respuestas_usuario = {}
-                    st.session_state.corregido = False
-                    st.success(
-                        f"⚡ Cargado desde caché local (0 tokens gastados): "
-                        f"{len(resultado_cacheado['preguntas'])} preguntas."
-                    )
-                    st.stop()
 
                 # 1. Intentar leer texto digital primero
                 reader = PdfReader(BytesIO(file_bytes))
@@ -578,23 +546,6 @@ with st.sidebar:
                         f"✅ ¡Éxito! Detectadas {len(preguntas_parseadas)} preguntas "
                         f"(de la nº{primer_num} a la nº{ultimo_num})."
                     )
-                    # Guardamos el resultado en caché: la próxima vez que subas este mismo PDF
-                    # se cargará al instante sin gastar tokens de la API.
-                    guardar_en_cache(hash_id, "resultado", {
-                        "texto_examen": texto_completo,
-                        "preguntas": preguntas_parseadas
-                    })
-
-                    # Subimos las preguntas nuevas a Supabase, a la tabla elegida en el sidebar
-                    if supabase_client is not None:
-                        with st.spinner(f"☁️ Subiendo preguntas a Supabase ('{tabla_seleccionada}')..."):
-                            ok_supabase, mensaje_supabase = subir_preguntas_a_supabase(
-                                tabla_seleccionada, preguntas_parseadas, hash_id, uploaded_file.name
-                            )
-                            if ok_supabase:
-                                st.success(f"☁️ {mensaje_supabase}")
-                            else:
-                                st.warning(f"⚠️ {mensaje_supabase}")
                 else:
                     st.warning("⚠️ La IA no pudo estructurar las preguntas. Revisa la pestaña de diagnóstico.")
                     st.session_state.preguntas_examen = None
@@ -616,16 +567,12 @@ with tab1:
             st.markdown("---")
             st.markdown(f"**Pregunta {num}:** {item['pregunta']}")
             
-            opciones_item = _normalizar_opciones(item.get("opciones"))
-            if not opciones_item:
-                st.warning(f"⚠️ La pregunta {num} no tiene opciones válidas y se omite.")
-                continue
-            opciones = [f"{opt['letra'].upper()}) {opt['texto']}" for opt in opciones_item]
+            opciones = [f"{opt['letra'].upper()}) {opt['texto']}" for opt in item["opciones"]]
             
             index_previo = None
             if num in st.session_state.respuestas_usuario:
                 letra_g = st.session_state.respuestas_usuario[num]
-                for i, opt in enumerate(opciones_item):
+                for i, opt in enumerate(item["opciones"]):
                     if opt["letra"] == letra_g:
                         index_previo = i
             
@@ -784,14 +731,3 @@ with tab3:
         for key in list(st.session_state.keys()):
             del st.session_state[key]
         st.rerun()
-
-    st.caption(f"📁 Caché local de PDFs ya procesados: `{CARPETA_CACHE}`")
-    if st.button("🧹 Borrar caché de PDFs (forzar reprocesar todo desde cero)"):
-        borrados = 0
-        for archivo in os.listdir(CARPETA_CACHE):
-            try:
-                os.remove(os.path.join(CARPETA_CACHE, archivo))
-                borrados += 1
-            except Exception:
-                pass
-        st.success(f"Caché borrada ({borrados} archivos eliminados).")
