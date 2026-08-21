@@ -5,6 +5,7 @@ import base64
 import re
 import time
 import random
+from datetime import datetime, timezone
 from io import BytesIO
 from pypdf import PdfReader
 from pdf2image import convert_from_bytes
@@ -33,7 +34,8 @@ TABLAS_SUPABASE_DISPONIBLES = [
     "Aplicaciones_teorica_Parte1",
     "Aplicaciones_teorica_Parte2",
     "Sistemas_practica",
-    "Sistemas_teorica"
+    "Sistemas_teorica",
+    "Bateria_aplicaciones"
 ]
 
 # --- LLAMADA A GROQ CON REINTENTOS AUTOMÁTICOS ANTE RATE LIMIT (429) ---
@@ -113,14 +115,20 @@ def cargar_preguntas_desde_supabase(nombre_tabla, seleccion_texto="", orden="Ord
             if isinstance(opciones, dict):
                 opciones = [{"letra": letra, "texto": texto_opt} for letra, texto_opt in opciones.items()]
 
+            # ✅ "clave" identifica de forma única la pregunta combinando tabla de origen + número,
+            # para poder mezclar preguntas de varias tablas (ej. en el Test de errores) sin que
+            # choquen dos preguntas con el mismo número pero de tablas distintas.
+            clave = f"{nombre_tabla}__{fila['numero']}"
             preguntas.append({
                 "numero": fila["numero"],
                 "pregunta": fila["pregunta"],
                 "opciones": opciones,
+                "tabla_origen": nombre_tabla,
+                "clave": clave,
             })
 
             if fila.get("respuesta"):
-                plantilla_respuestas[str(fila["numero"])] = str(fila["respuesta"]).lower().strip()
+                plantilla_respuestas[clave] = str(fila["respuesta"]).lower().strip()
 
         if orden == "Orden numérico":
             preguntas.sort(key=lambda p: p["numero"])
@@ -135,6 +143,169 @@ def cargar_preguntas_desde_supabase(nombre_tabla, seleccion_texto="", orden="Ord
         return preguntas, plantilla_respuestas, None
     except Exception as e:
         return None, None, f"No se pudo leer de Supabase: {e}"
+
+
+# --- BANCO DE ERRORES: REGISTRAR, CARGAR Y LIMPIAR EN SUPABASE ---
+def registrar_errores_en_supabase(tabla_origen, numeros_fallados):
+    """Sube (o actualiza) en 'errores_usuario' las preguntas falladas/en blanco de un test.
+    Si la pregunta ya estaba en el banco de errores, solo incrementa el contador de veces
+    fallada en vez de duplicarla (gracias al unique(tabla_origen, numero))."""
+    if supabase_client is None or not numeros_fallados:
+        return 0, None
+    try:
+        numeros_fallados = list(numeros_fallados)
+        existentes = supabase_client.table("errores_usuario") \
+            .select("numero, veces_fallada") \
+            .eq("tabla_origen", tabla_origen) \
+            .in_("numero", numeros_fallados) \
+            .execute().data
+        existentes_map = {e["numero"]: e.get("veces_fallada") or 1 for e in existentes}
+
+        nuevos = [n for n in numeros_fallados if n not in existentes_map]
+        actualizados = [n for n in numeros_fallados if n in existentes_map]
+        ahora = datetime.now(timezone.utc).isoformat()
+
+        if nuevos:
+            filas_nuevas = [{"tabla_origen": tabla_origen, "numero": n} for n in nuevos]
+            supabase_client.table("errores_usuario").insert(filas_nuevas).execute()
+
+        for n in actualizados:
+            supabase_client.table("errores_usuario").update({
+                "veces_fallada": existentes_map[n] + 1,
+                "ultima_vez_fallada": ahora,
+            }).eq("tabla_origen", tabla_origen).eq("numero", n).execute()
+
+        return len(numeros_fallados), None
+    except Exception as e:
+        return 0, str(e)
+
+
+def contar_errores_pendientes():
+    """Cuenta cuántas preguntas hay actualmente en el banco de errores."""
+    if supabase_client is None:
+        return None
+    try:
+        resultado = supabase_client.table("errores_usuario").select("id", count="exact").execute()
+        return resultado.count or 0
+    except Exception:
+        return None
+
+
+def cargar_preguntas_de_errores():
+    """Recupera todas las preguntas guardadas en 'errores_usuario', agrupadas por tabla de
+    origen, y trae el enunciado/opciones/respuesta ACTUALES desde cada tabla original
+    (no se guarda una copia del contenido, solo la referencia tabla+número)."""
+    if supabase_client is None:
+        return None, None, "Supabase no está configurado."
+    try:
+        filas_error = supabase_client.table("errores_usuario").select("tabla_origen, numero").execute().data
+        if not filas_error:
+            return [], {}, None
+
+        por_tabla = {}
+        for fila in filas_error:
+            por_tabla.setdefault(fila["tabla_origen"], []).append(fila["numero"])
+
+        preguntas = []
+        plantilla_respuestas = {}
+        for tabla_origen, numeros in por_tabla.items():
+            respuesta = supabase_client.table(tabla_origen) \
+                .select("numero, pregunta, opciones, respuesta") \
+                .in_("numero", numeros).execute()
+            for fila in respuesta.data:
+                opciones = fila.get("opciones")
+                if isinstance(opciones, dict):
+                    opciones = [{"letra": letra, "texto": texto_opt} for letra, texto_opt in opciones.items()]
+
+                clave = f"{tabla_origen}__{fila['numero']}"
+                preguntas.append({
+                    "numero": fila["numero"],
+                    "pregunta": fila["pregunta"],
+                    "opciones": opciones,
+                    "tabla_origen": tabla_origen,
+                    "clave": clave,
+                })
+                if fila.get("respuesta"):
+                    plantilla_respuestas[clave] = str(fila["respuesta"]).lower().strip()
+
+        preguntas.sort(key=lambda p: (p["tabla_origen"], p["numero"]))
+        return preguntas, plantilla_respuestas, None
+    except Exception as e:
+        return None, None, f"No se pudo leer el Test de errores desde Supabase: {e}"
+
+
+def borrar_errores_acertados(referencias):
+    """Borra de 'errores_usuario' las preguntas indicadas (lista de tuplas tabla_origen, numero).
+    Esto NUNCA toca la tabla original de preguntas, solo el banco de errores."""
+    if supabase_client is None or not referencias:
+        return None
+    try:
+        for tabla_origen, numero in referencias:
+            supabase_client.table("errores_usuario").delete() \
+                .eq("tabla_origen", tabla_origen).eq("numero", numero).execute()
+        return None
+    except Exception as e:
+        return str(e)
+
+
+# --- TEST MIXTO: N PREGUNTAS AL AZAR, PROPORCIONAL AL TAMAÑO DE CADA TABLA ---
+def cargar_test_mixto(n_preguntas):
+    """Genera un examen mezclando N preguntas al azar de TODAS las tablas de
+    TABLAS_SUPABASE_DISPONIBLES. El azar es 'puro' sobre el conjunto combinado de todas
+    las preguntas existentes, así que las tablas más grandes aportan proporcionalmente
+    más preguntas (igual que un examen real mezclado por temarios de distinto peso)."""
+    if supabase_client is None:
+        return None, None, 0, "Supabase no está configurado."
+    try:
+        # 1. Consulta ligera: solo pedimos "numero" de cada tabla para construir el pool,
+        # sin traernos el contenido completo todavía (más rápido y barato).
+        pool = []
+        for tabla in TABLAS_SUPABASE_DISPONIBLES:
+            filas = supabase_client.table(tabla).select("numero").execute().data
+            for fila in filas:
+                if fila.get("numero") is not None:
+                    pool.append((tabla, fila["numero"]))
+
+        if not pool:
+            return [], {}, 0, None
+
+        n_final = min(n_preguntas, len(pool))
+        seleccionados = random.sample(pool, n_final)
+
+        # 2. Agrupamos lo seleccionado por tabla para traer el contenido completo
+        # con el mínimo de consultas posible (una por tabla implicada, no una por pregunta).
+        por_tabla = {}
+        for tabla, numero in seleccionados:
+            por_tabla.setdefault(tabla, []).append(numero)
+
+        preguntas = []
+        plantilla_respuestas = {}
+        for tabla_origen, numeros in por_tabla.items():
+            respuesta = supabase_client.table(tabla_origen) \
+                .select("numero, pregunta, opciones, respuesta") \
+                .in_("numero", numeros).execute()
+            for fila in respuesta.data:
+                opciones = fila.get("opciones")
+                if isinstance(opciones, dict):
+                    opciones = [{"letra": letra, "texto": texto_opt} for letra, texto_opt in opciones.items()]
+
+                clave = f"{tabla_origen}__{fila['numero']}"
+                preguntas.append({
+                    "numero": fila["numero"],
+                    "pregunta": fila["pregunta"],
+                    "opciones": opciones,
+                    "tabla_origen": tabla_origen,
+                    "clave": clave,
+                })
+                if fila.get("respuesta"):
+                    plantilla_respuestas[clave] = str(fila["respuesta"]).lower().strip()
+
+        # 3. Mezclamos el orden final para que no salgan agrupadas por tabla
+        random.shuffle(preguntas)
+
+        return preguntas, plantilla_respuestas, n_final, None
+    except Exception as e:
+        return None, None, 0, f"No se pudo generar el Test Mixto desde Supabase: {e}"
 
 st.set_page_config(page_title="IA Oposiciones - Escaneados Pro", layout="wide")
 st.title("🛡️ Sistema Inteligente de Exámenes (Soporta PDFs Escaneados)")
@@ -163,6 +334,10 @@ if "texto_respuestas" not in st.session_state:
     st.session_state.texto_respuestas = ""
 if "ultima_respuesta_estructuracion" not in st.session_state:
     st.session_state.ultima_respuesta_estructuracion = ""
+if "modo_test_errores" not in st.session_state:
+    st.session_state.modo_test_errores = False
+if "modo_test_mixto" not in st.session_state:
+    st.session_state.modo_test_mixto = False
 
 # --- FUNCIÓN AUXILIAR PARA REDUCIR TAMAÑO Y AHORRAR TOKENS ---
 def redimensionar_para_vision(img, ancho_max=1200):
@@ -227,6 +402,8 @@ with st.sidebar:
                 st.session_state.preguntas_examen = preguntas_supabase
                 st.session_state.respuestas_usuario = {}
                 st.session_state.corregido = False
+                st.session_state.modo_test_errores = False
+                st.session_state.modo_test_mixto = False
                 # ✅ Comparamos directamente contra la respuesta guardada en la BD, sin necesidad
                 # de subir una plantilla de respuestas aparte.
                 st.session_state.plantilla_respuestas = plantilla_supabase
@@ -238,6 +415,60 @@ with st.sidebar:
                 st.success(mensaje)
             else:
                 st.warning("No hay preguntas que coincidan con esa selección en esta tabla.")
+
+    st.header("🔁 Test de errores")
+    num_errores_pendientes = contar_errores_pendientes()
+    if num_errores_pendientes is not None:
+        if num_errores_pendientes > 0:
+            st.caption(f"📌 Tienes **{num_errores_pendientes}** pregunta(s) pendientes en tu banco de errores.")
+        else:
+            st.caption("📌 Tu banco de errores está vacío. ¡Bien hecho!")
+    if supabase_client is not None and st.button("🔁 Cargar Test de errores"):
+        with st.spinner("Consultando tu banco de errores en Supabase..."):
+            preguntas_error, plantilla_error, error_error = cargar_preguntas_de_errores()
+            if error_error:
+                st.error(error_error)
+            elif preguntas_error:
+                st.session_state.preguntas_examen = preguntas_error
+                st.session_state.respuestas_usuario = {}
+                st.session_state.corregido = False
+                st.session_state.plantilla_respuestas = plantilla_error
+                st.session_state.modo_test_errores = True
+                st.session_state.modo_test_mixto = False
+                st.success(f"✅ Cargado Test de errores con {len(preguntas_error)} pregunta(s) pendientes.")
+            else:
+                st.info("🎉 ¡No tienes errores guardados! Tu banco de errores está vacío.")
+
+    st.header("🧪 Test Mixto")
+    st.caption(
+        "Genera un examen con preguntas al azar mezclando TODAS las tablas de opos. "
+        "El azar es proporcional al tamaño de cada tabla (las tablas más grandes aportan más preguntas)."
+    )
+    n_preguntas_mixto = st.number_input(
+        "¿Cuántas preguntas quieres?",
+        min_value=1, max_value=500, value=30, step=1,
+        key="n_preguntas_test_mixto"
+    )
+    if supabase_client is not None and st.button("🎲 Generar Test Mixto"):
+        with st.spinner("Sorteando preguntas de todas las tablas..."):
+            preguntas_mixto, plantilla_mixto, n_generadas, error_mixto = cargar_test_mixto(n_preguntas_mixto)
+            if error_mixto:
+                st.error(error_mixto)
+            elif preguntas_mixto:
+                st.session_state.preguntas_examen = preguntas_mixto
+                st.session_state.respuestas_usuario = {}
+                st.session_state.corregido = False
+                st.session_state.plantilla_respuestas = plantilla_mixto
+                st.session_state.modo_test_errores = False
+                st.session_state.modo_test_mixto = True
+                mensaje = f"✅ Test Mixto generado con {n_generadas} pregunta(s)"
+                if n_generadas < n_preguntas_mixto:
+                    mensaje += f" (pediste {n_preguntas_mixto}, pero solo hay {n_generadas} preguntas disponibles en total)."
+                else:
+                    mensaje += "."
+                st.success(mensaje)
+            else:
+                st.warning("No se encontraron preguntas en ninguna de las tablas configuradas.")
 
     st.header("📥 Carga del Examen")
     uploaded_file = st.file_uploader("Sube el PDF del examen (Digital o Escaneado)", type="pdf")
@@ -536,10 +767,18 @@ with st.sidebar:
                         "Revisa la pestaña 🔧 Diagnóstico para ver el detalle."
                     )
 
+                # PDF suelto: no viene de ninguna tabla de Supabase, así que no puede
+                # añadirse al banco de errores (no hay tabla+numero de referencia).
+                for p in preguntas_parseadas:
+                    p["tabla_origen"] = None
+                    p["clave"] = str(p.get("numero"))
+
                 if preguntas_parseadas and len(preguntas_parseadas) > 0:
                     st.session_state.preguntas_examen = preguntas_parseadas
                     st.session_state.respuestas_usuario = {}
                     st.session_state.corregido = False
+                    st.session_state.modo_test_errores = False
+                    st.session_state.modo_test_mixto = False
                     primer_num = preguntas_parseadas[0].get("numero")
                     ultimo_num = preguntas_parseadas[-1].get("numero")
                     st.success(
@@ -563,31 +802,34 @@ with tab1:
         st.subheader("✍️ Responde al examen de la oposición")
         
         for item in st.session_state.preguntas_examen:
-            num = str(item["numero"])
+            # ✅ "clave" identifica la pregunta de forma única (tabla_origen + numero cuando
+            # viene de Supabase, o solo el numero si viene de un PDF suelto).
+            clave = item.get("clave") or str(item["numero"])
             st.markdown("---")
-            st.markdown(f"**Pregunta {num}:** {item['pregunta']}")
+            etiqueta_origen = f" _(de {item['tabla_origen']})_" if (st.session_state.modo_test_errores or st.session_state.modo_test_mixto) and item.get("tabla_origen") else ""
+            st.markdown(f"**Pregunta {item['numero']}{etiqueta_origen}:** {item['pregunta']}")
             
             opciones = [f"{opt['letra'].upper()}) {opt['texto']}" for opt in item["opciones"]]
             
             index_previo = None
-            if num in st.session_state.respuestas_usuario:
-                letra_g = st.session_state.respuestas_usuario[num]
+            if clave in st.session_state.respuestas_usuario:
+                letra_g = st.session_state.respuestas_usuario[clave]
                 for i, opt in enumerate(item["opciones"]):
                     if opt["letra"] == letra_g:
                         index_previo = i
             
             seleccion = st.radio(
-                f"p_{num}", options=opciones, index=index_previo, 
-                key=f"radio_{num}", label_visibility="collapsed", disabled=st.session_state.corregido
+                f"p_{clave}", options=opciones, index=index_previo, 
+                key=f"radio_{clave}", label_visibility="collapsed", disabled=st.session_state.corregido
             )
             
             if seleccion and not st.session_state.corregido:
-                st.session_state.respuestas_usuario[num] = seleccion[0].lower()
+                st.session_state.respuestas_usuario[clave] = seleccion[0].lower()
             
             # ✅ CORRECCIÓN MEJORADA: Mostrar resultado para TODAS las preguntas
             if st.session_state.corregido:
-                marcada = st.session_state.respuestas_usuario.get(num)
-                correcta = st.session_state.plantilla_respuestas.get(num)
+                marcada = st.session_state.respuestas_usuario.get(clave)
+                correcta = st.session_state.plantilla_respuestas.get(clave)
                 
                 if correcta:
                     if marcada == correcta:
@@ -599,21 +841,78 @@ with tab1:
                 else:
                     # Si no hay respuesta en la plantilla, mostrar aviso
                     if marcada:
-                        st.info(f"⚪ Pregunta {num}: Marcaste la {marcada.upper()}. (No hay respuesta correcta cargada para comparar)")
+                        st.info(f"⚪ Pregunta {item['numero']}: Marcaste la {marcada.upper()}. (No hay respuesta correcta cargada para comparar)")
                     else:
-                        st.info(f"⚪ Pregunta {num}: Sin contestar. (No hay respuesta correcta cargada para comparar)")
+                        st.info(f"⚪ Pregunta {item['numero']}: Sin contestar. (No hay respuesta correcta cargada para comparar)")
 
         st.markdown("---")
-        c1, c2 = st.columns(2)
+
+        # ¿El examen actual viene de alguna tabla de Supabase? (si es un PDF suelto, no hay
+        # tabla_origen y por tanto no se puede añadir al banco de errores)
+        viene_de_supabase = any(item.get("tabla_origen") for item in st.session_state.preguntas_examen)
+
+        c1, c2, c3 = st.columns(3)
         with c1:
             if st.button("📊 Corregir Examen", type="primary", disabled=st.session_state.corregido):
                 st.session_state.corregido = True
+
+                # Si estamos haciendo el Test de errores, las preguntas ACERTADAS se borran
+                # automáticamente del banco de errores (las falladas se quedan para repasar).
+                if st.session_state.modo_test_errores:
+                    aciertos_para_borrar = []
+                    for item in st.session_state.preguntas_examen:
+                        clave = item["clave"]
+                        correcta = st.session_state.plantilla_respuestas.get(clave)
+                        marcada = st.session_state.respuestas_usuario.get(clave)
+                        if correcta and marcada == correcta:
+                            aciertos_para_borrar.append((item["tabla_origen"], item["numero"]))
+                    if aciertos_para_borrar:
+                        error_borrado = borrar_errores_acertados(aciertos_para_borrar)
+                        if error_borrado:
+                            st.toast(f"⚠️ No se pudieron borrar algunos errores: {error_borrado}")
+                        else:
+                            st.toast(f"🗑️ {len(aciertos_para_borrar)} pregunta(s) acertada(s) borradas de tu banco de errores.")
+
                 st.rerun()
         with c2:
             if st.button("🔄 Reiniciar Respuestas"):
                 st.session_state.respuestas_usuario = {}
                 st.session_state.corregido = False
                 st.rerun()
+        with c3:
+            # 🔒 Oculto hasta que se corrija el examen. No aparece en modo Test de errores
+            # (ese banco ya se autogestiona al corregir) ni en exámenes de PDF suelto.
+            if st.session_state.corregido and viene_de_supabase and not st.session_state.modo_test_errores:
+                if st.button("➕ Añadir errores a Test de errores"):
+                    fallos_por_tabla = {}
+                    for item in st.session_state.preguntas_examen:
+                        if not item.get("tabla_origen"):
+                            continue
+                        clave = item["clave"]
+                        correcta = st.session_state.plantilla_respuestas.get(clave)
+                        if not correcta:
+                            continue  # sin respuesta correcta cargada, no se puede evaluar
+                        marcada = st.session_state.respuestas_usuario.get(clave)
+                        # ✅ Solo se suben preguntas FALLADAS (marcada y distinta de la correcta).
+                        # Las dejadas en blanco (marcada is None) NO se añaden al banco de errores.
+                        if marcada is not None and marcada != correcta:
+                            fallos_por_tabla.setdefault(item["tabla_origen"], []).append(item["numero"])
+
+                    total_subidos = 0
+                    errores_subida = []
+                    for tabla_origen, numeros in fallos_por_tabla.items():
+                        subidos, err = registrar_errores_en_supabase(tabla_origen, numeros)
+                        if err:
+                            errores_subida.append(err)
+                        else:
+                            total_subidos += subidos
+
+                    if errores_subida:
+                        st.error("⚠️ Hubo problemas subiendo algunos errores: " + "; ".join(errores_subida))
+                    elif total_subidos:
+                        st.success(f"✅ {total_subidos} pregunta(s) añadidas a tu Test de errores.")
+                    else:
+                        st.info("🎉 No has fallado ninguna pregunta con respuesta correcta cargada, nada que añadir.")
 
         # 📊 RESUMEN DE NOTAS (MEJORADO)
         if st.session_state.corregido and st.session_state.preguntas_examen:
@@ -622,8 +921,10 @@ with tab1:
             
             total_preguntas = len(st.session_state.preguntas_examen)
             
-            # ✅ SOLO las preguntas que están en el examen cargado
-            numeros_examen = {str(p["numero"]) for p in st.session_state.preguntas_examen}
+            # ✅ SOLO las preguntas que están en el examen cargado (comparamos por "clave",
+            # que combina tabla_origen+numero para no confundir preguntas de distintas tablas
+            # con el mismo número, como puede pasar en el Test de errores)
+            numeros_examen = {p.get("clave") or str(p["numero"]) for p in st.session_state.preguntas_examen}
             plantilla_filtrada = {
                 n: r for n, r in st.session_state.plantilla_respuestas.items()
                 if n in numeros_examen
@@ -663,10 +964,14 @@ with tab1:
                 progreso = aciertos / preguntas_con_respuesta
                 st.progress(progreso, text=f"Progreso: {aciertos}/{preguntas_con_respuesta} correctas")
             
-            # Aviso si faltan respuestas
-            sin_plantilla = [n for n in numeros_examen if n not in plantilla_filtrada]
-            if sin_plantilla:
-                st.info(f"ℹ️ Preguntas sin respuesta correcta cargada: {', '.join(sorted(sin_plantilla, key=int))}")
+            # Aviso si faltan respuestas (mostramos el número real de pregunta, no la "clave" interna)
+            claves_sin_plantilla = [n for n in numeros_examen if n not in plantilla_filtrada]
+            if claves_sin_plantilla:
+                numeros_sin_plantilla = sorted(
+                    item["numero"] for item in st.session_state.preguntas_examen
+                    if (item.get("clave") or str(item["numero"])) in claves_sin_plantilla
+                )
+                st.info(f"ℹ️ Preguntas sin respuesta correcta cargada: {', '.join(str(n) for n in numeros_sin_plantilla)}")
 
 with tab2:
     if not st.session_state.texto_examen:
