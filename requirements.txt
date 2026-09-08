@@ -8,6 +8,9 @@ streamlit>=1.28.0
 # Cliente de IA (Groq)
 groq>=0.4.0
 
+# Cliente de Supabase (base de datos)
+supabase>=2.3.0
+
 # Procesamiento de PDFs
 pypdf>=4.0.0
 pdf2image>=1.16.0
