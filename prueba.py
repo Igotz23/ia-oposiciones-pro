@@ -51,7 +51,7 @@ TABLAS_SUPABASE_DISPONIBLES = [
     "Aplicaciones_teorica_Parte2",
     "Sistemas_practica",
     "Sistemas_teorica",
-    "Bateria_aplicaciones"
+    "Bateria_aplicaciones",
     "subalterna"
 ]
 
