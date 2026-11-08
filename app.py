@@ -1,4 +1,5 @@
 import streamlit as st
+import streamlit.components.v1 as components
 import json
 import os
 import base64
@@ -31,12 +32,12 @@ if SUPABASE_DISPONIBLE and os.environ.get("SUPABASE_URL") and os.environ.get("SU
 
 # Lista de tablas/bases de datos disponibles en Supabase. Añade aquí más según crees nuevas partes.
 TABLAS_SUPABASE_DISPONIBLES = [
+    "subalterna",
     "Aplicaciones_teorica_Parte1",
     "Aplicaciones_teorica_Parte2",
     "Sistemas_practica",
     "Sistemas_teorica",
-    "Bateria_aplicaciones",
-    "subalterna"
+    "Bateria_aplicaciones"
 ]
 
 # --- LLAMADA A GROQ CON REINTENTOS AUTOMÁTICOS ANTE RATE LIMIT (429) ---
@@ -176,11 +177,13 @@ def registrar_errores_en_supabase(tabla_origen, numeros_fallados):
                 "ultima_vez_fallada": ahora,
             }).eq("tabla_origen", tabla_origen).eq("numero", n).execute()
 
+        contar_errores_pendientes.clear()
         return len(numeros_fallados), None
     except Exception as e:
         return 0, str(e)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
 def contar_errores_pendientes():
     """Cuenta cuántas preguntas hay actualmente en el banco de errores."""
     if supabase_client is None:
@@ -244,6 +247,7 @@ def borrar_errores_acertados(referencias):
         for tabla_origen, numero in referencias:
             supabase_client.table("errores_usuario").delete() \
                 .eq("tabla_origen", tabla_origen).eq("numero", numero).execute()
+        contar_errores_pendientes.clear()
         return None
     except Exception as e:
         return str(e)
@@ -327,6 +331,7 @@ if "respuestas_usuario" not in st.session_state:
     st.session_state.respuestas_usuario = {}
 if "corregido" not in st.session_state:
     st.session_state.corregido = False
+    st.session_state.idx_pregunta = 0
 if "historial_chat" not in st.session_state:
     st.session_state.historial_chat = []
 if "plantilla_respuestas" not in st.session_state:
@@ -339,6 +344,8 @@ if "modo_test_errores" not in st.session_state:
     st.session_state.modo_test_errores = False
 if "modo_test_mixto" not in st.session_state:
     st.session_state.modo_test_mixto = False
+if "idx_pregunta" not in st.session_state:
+    st.session_state.idx_pregunta = 0
 
 # --- FUNCIÓN AUXILIAR PARA REDUCIR TAMAÑO Y AHORRAR TOKENS ---
 def redimensionar_para_vision(img, ancho_max=1200):
@@ -363,6 +370,18 @@ def convertir_a_jpeg(img):
 
 # --- BARRA LATERAL: CARGA Y PROCESAMIENTO ---
 with st.sidebar:
+    st.header("🎯 Modo de estudio")
+    st.radio(
+        "modo_estudio_radio",
+        options=["Modo normal", "Modo examen"],
+        key="modo_estudio",
+        label_visibility="collapsed",
+        help="Normal: te dice al momento si has acertado (verde) o fallado (rojo) y cuál era la correcta. "
+             "Examen: no ves nada hasta terminar todas las preguntas; entonces sale la nota y el resumen de fallos."
+    )
+    st.caption("📖 **Normal**: corrección al instante en cada pregunta.  \n📝 **Examen**: resultados solo al final.")
+    st.markdown("---")
+
     st.header("🗄️ Base de datos (Supabase)")
     if supabase_client is None:
         st.caption("⚠️ Supabase no configurado. Añade SUPABASE_URL y SUPABASE_KEY al .env para activarlo.")
@@ -403,6 +422,7 @@ with st.sidebar:
                 st.session_state.preguntas_examen = preguntas_supabase
                 st.session_state.respuestas_usuario = {}
                 st.session_state.corregido = False
+                st.session_state.idx_pregunta = 0
                 st.session_state.modo_test_errores = False
                 st.session_state.modo_test_mixto = False
                 # ✅ Comparamos directamente contra la respuesta guardada en la BD, sin necesidad
@@ -433,6 +453,7 @@ with st.sidebar:
                 st.session_state.preguntas_examen = preguntas_error
                 st.session_state.respuestas_usuario = {}
                 st.session_state.corregido = False
+                st.session_state.idx_pregunta = 0
                 st.session_state.plantilla_respuestas = plantilla_error
                 st.session_state.modo_test_errores = True
                 st.session_state.modo_test_mixto = False
@@ -459,6 +480,7 @@ with st.sidebar:
                 st.session_state.preguntas_examen = preguntas_mixto
                 st.session_state.respuestas_usuario = {}
                 st.session_state.corregido = False
+                st.session_state.idx_pregunta = 0
                 st.session_state.plantilla_respuestas = plantilla_mixto
                 st.session_state.modo_test_errores = False
                 st.session_state.modo_test_mixto = True
@@ -778,6 +800,7 @@ with st.sidebar:
                     st.session_state.preguntas_examen = preguntas_parseadas
                     st.session_state.respuestas_usuario = {}
                     st.session_state.corregido = False
+                    st.session_state.idx_pregunta = 0
                     st.session_state.modo_test_errores = False
                     st.session_state.modo_test_mixto = False
                     primer_num = preguntas_parseadas[0].get("numero")
@@ -793,6 +816,193 @@ with st.sidebar:
             except Exception as e:
                 st.error(f"Error al procesar: {e}")
 
+
+# --- Los fragmentos permiten que al clicar una opción solo se recargue la pregunta, no toda la app ---
+_fragmento = getattr(st, "fragment", None) or getattr(st, "experimental_fragment", None)
+
+def _rerun_zona():
+    """Recarga solo el fragmento (rápido). Si la versión de Streamlit no lo soporta, recarga todo."""
+    try:
+        st.rerun(scope="fragment")
+    except Exception:
+        st.rerun()
+
+def _rerun_app():
+    try:
+        st.rerun(scope="app")
+    except TypeError:
+        st.rerun()
+
+def _decorar(f):
+    return _fragmento(f) if _fragmento else f
+
+@_decorar
+def render_pregunta(modo_examen, mostrar_origen):
+    preguntas = st.session_state.preguntas_examen
+    total = len(preguntas)
+    idx = min(max(st.session_state.idx_pregunta, 0), total - 1)
+    st.session_state.idx_pregunta = idx
+    item = preguntas[idx]
+    clave = item.get("clave") or str(item["numero"])
+    marcada = st.session_state.respuestas_usuario.get(clave)
+    correcta = st.session_state.plantilla_respuestas.get(clave)
+
+    st.caption(("📝 MODO EXAMEN" if modo_examen else "📖 MODO NORMAL") + f"  ·  Pregunta {idx + 1} de {total}  ·  ⌨️ 1-4 responder · ← → navegar")
+    st.progress((idx + 1) / total)
+
+    etiqueta_origen = f" _(de {item['tabla_origen']})_" if mostrar_origen and item.get("tabla_origen") else ""
+    st.markdown(f"#### Pregunta {item['numero']}{etiqueta_origen}")
+    st.markdown(f"**{item['pregunta']}**")
+
+    # En modo normal, al contestar se bloquea la pregunta y se colorean las opciones
+    bloqueada = (not modo_examen) and marcada is not None
+
+    for opt in item["opciones"]:
+        letra = str(opt["letra"]).lower()
+        texto_opt = f"{letra.upper()}) {opt['texto']}"
+        if bloqueada:
+            if correcta and letra == correcta:
+                st.success(texto_opt, icon="✅")
+            elif letra == marcada:
+                if correcta:
+                    st.error(texto_opt, icon="❌")
+                else:
+                    st.info(texto_opt, icon="⚪")
+            else:
+                with st.container(border=True):
+                    st.markdown(texto_opt)
+        else:
+            es_marcada = (marcada == letra)
+            if st.button(
+                texto_opt,
+                key=f"opt_{clave}_{letra}",
+                use_container_width=True,
+                type="primary" if (modo_examen and es_marcada) else "secondary",
+            ):
+                st.session_state.respuestas_usuario[clave] = letra
+                _rerun_zona()
+
+    if modo_examen and marcada is not None:
+        if st.button("✖️ Borrar mi respuesta", key=f"borrar_{clave}"):
+            del st.session_state.respuestas_usuario[clave]
+            _rerun_zona()
+
+    st.markdown("---")
+    es_ultima = (idx == total - 1)
+    nav1, nav2 = st.columns(2)
+    with nav1:
+        if st.button("‹ Anterior", disabled=(idx == 0), use_container_width=True):
+            st.session_state.idx_pregunta = idx - 1
+            _rerun_zona()
+    with nav2:
+        if not es_ultima:
+            destacar = modo_examen or marcada is not None
+            if st.button("Siguiente ›", type="primary" if destacar else "secondary", use_container_width=True):
+                st.session_state.idx_pregunta = idx + 1
+                _rerun_zona()
+        else:
+            if st.button("🏁 Finalizar y ver resultados", type="primary", use_container_width=True):
+                st.session_state.corregido = True
+
+                # Test de errores: las ACERTADAS se borran del banco de errores
+                if st.session_state.modo_test_errores:
+                    aciertos_para_borrar = []
+                    for it in preguntas:
+                        k = it["clave"]
+                        c = st.session_state.plantilla_respuestas.get(k)
+                        m = st.session_state.respuestas_usuario.get(k)
+                        if c and m == c:
+                            aciertos_para_borrar.append((it["tabla_origen"], it["numero"]))
+                    if aciertos_para_borrar:
+                        error_borrado = borrar_errores_acertados(aciertos_para_borrar)
+                        if error_borrado:
+                            st.toast(f"⚠️ No se pudieron borrar algunos errores: {error_borrado}")
+                        else:
+                            st.toast(f"🗑️ {len(aciertos_para_borrar)} pregunta(s) acertada(s) borradas de tu banco de errores.")
+                _rerun_app()
+
+    sin_contestar = sum(1 for it in preguntas if (it.get("clave") or str(it["numero"])) not in st.session_state.respuestas_usuario)
+    if es_ultima and sin_contestar:
+        st.caption(f"⚠️ Te quedan {sin_contestar} pregunta(s) sin contestar (contarán como en blanco).")
+
+
+ATAJOS_TECLADO_JS = """
+<script>
+(function () {
+  const w = window.parent, doc = w.document;
+  if (w.__opoKeys) doc.removeEventListener('keydown', w.__opoKeys);
+  w.__opoKeys = function (e) {
+    const t = e.target;
+    if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.isContentEditable)) return;
+    if (e.ctrlKey || e.metaKey || e.altKey) return;
+    const zona = doc.querySelector('[data-testid="stMain"]') || doc.querySelector('section.main') || doc;
+    const botones = Array.from(zona.querySelectorAll('button'));
+    const buscar = f => botones.find(b => f((b.innerText || '').trim()));
+    let b = null;
+    if (['1', '2', '3', '4'].includes(e.key)) {
+      const letra = 'ABCD'[parseInt(e.key) - 1];
+      b = buscar(txt => txt.startsWith(letra + ')'));
+    } else if (e.key === 'ArrowRight') {
+      b = buscar(txt => txt.includes('Siguiente'));
+    } else if (e.key === 'ArrowLeft') {
+      b = buscar(txt => txt.includes('Anterior'));
+    }
+    if (b && !b.disabled) { e.preventDefault(); b.click(); }
+  };
+  doc.addEventListener('keydown', w.__opoKeys);
+})();
+</script>
+"""
+
+# --- Estilo: tipografía limpia + opciones alineadas a la izquierda ---
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700&family=JetBrains+Mono:wght@500&display=swap');
+
+/* Tipografía principal (se evitan los iconos de Streamlit para no romperlos) */
+[data-testid="stMain"] .stMarkdown,
+[data-testid="stMain"] .stMarkdown p,
+[data-testid="stMain"] h1, [data-testid="stMain"] h2,
+[data-testid="stMain"] h3, [data-testid="stMain"] h4,
+[data-testid="stMain"] .stButton button,
+[data-testid="stMain"] .stButton button p,
+[data-testid="stMain"] [data-testid="stAlert"] p,
+[data-testid="stMain"] [data-testid="stMetricValue"],
+[data-testid="stMain"] [data-testid="stMetricLabel"] p,
+[data-testid="stSidebar"] .stMarkdown p,
+[data-testid="stSidebar"] label p {
+    font-family: 'Plus Jakarta Sans', 'Segoe UI', sans-serif !important;
+}
+
+/* Enunciado en negrita, pero más ligero que el negro por defecto */
+[data-testid="stMain"] .stMarkdown strong { font-weight: 700; }
+
+/* Opciones: texto normal (no negrita), tamaño contenido */
+[class*="st-key-opt_"] button p {
+    font-weight: 500 !important;
+    font-size: 0.95rem !important;
+    line-height: 1.4 !important;
+}
+
+/* Etiqueta pequeña "PREGUNTA X DE Y" en monoespaciada, como en la web original */
+[data-testid="stMain"] [data-testid="stCaptionContainer"],
+[data-testid="stMain"] [data-testid="stCaptionContainer"] p {
+    font-family: 'JetBrains Mono', ui-monospace, monospace !important;
+    font-size: 0.72rem !important;
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+}
+
+/* Todas las opciones empiezan en el mismo punto de la izquierda */
+[class*="st-key-opt_"] button,
+[class*="st-key-opt_"] button > div,
+[class*="st-key-opt_"] button p {
+    justify-content: flex-start !important;
+    text-align: left !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # --- PANTALLA PRINCIPAL: DOS PESTAÑAS ---
 tab1, tab2, tab3 = st.tabs(["📝 Cuestionario Interactivo", "💬 Chat con el Examen", "🔧 Diagnóstico"])
 
@@ -800,179 +1010,120 @@ with tab1:
     if st.session_state.preguntas_examen is None:
         st.info("👋 Sube tu examen en PDF en la barra lateral izquierda y pulsa 'Procesar Examen'.")
     else:
-        st.subheader("✍️ Responde al examen de la oposición")
-        
-        for item in st.session_state.preguntas_examen:
-            # ✅ "clave" identifica la pregunta de forma única (tabla_origen + numero cuando
-            # viene de Supabase, o solo el numero si viene de un PDF suelto).
-            clave = item.get("clave") or str(item["numero"])
-            st.markdown("---")
-            etiqueta_origen = f" _(de {item['tabla_origen']})_" if (st.session_state.modo_test_errores or st.session_state.modo_test_mixto) and item.get("tabla_origen") else ""
-            st.markdown(f"**Pregunta {item['numero']}{etiqueta_origen}:** {item['pregunta']}")
-            
-            opciones = [f"{opt['letra'].upper()}) {opt['texto']}" for opt in item["opciones"]]
-            
-            index_previo = None
-            if clave in st.session_state.respuestas_usuario:
-                letra_g = st.session_state.respuestas_usuario[clave]
-                for i, opt in enumerate(item["opciones"]):
-                    if opt["letra"] == letra_g:
-                        index_previo = i
-            
-            seleccion = st.radio(
-                f"p_{clave}", options=opciones, index=index_previo, 
-                key=f"radio_{clave}", label_visibility="collapsed", disabled=st.session_state.corregido
-            )
-            
-            if seleccion and not st.session_state.corregido:
-                st.session_state.respuestas_usuario[clave] = seleccion[0].lower()
-            
-            # ✅ CORRECCIÓN MEJORADA: Mostrar resultado para TODAS las preguntas
-            if st.session_state.corregido:
-                marcada = st.session_state.respuestas_usuario.get(clave)
-                correcta = st.session_state.plantilla_respuestas.get(clave)
-                
-                if correcta:
-                    if marcada == correcta:
-                        st.success(f"🟢 ¡Correcto! La respuesta es la {correcta.upper()}")
-                    elif marcada is None:
-                        st.warning(f"🟡 Pregunta no contestada. La correcta era la {correcta.upper()}")
-                    else:
-                        st.error(f"🔴 Fallaste. Marcaste la {marcada.upper()}. La correcta era la {correcta.upper()}")
-                else:
-                    # Si no hay respuesta en la plantilla, mostrar aviso
-                    if marcada:
-                        st.info(f"⚪ Pregunta {item['numero']}: Marcaste la {marcada.upper()}. (No hay respuesta correcta cargada para comparar)")
-                    else:
-                        st.info(f"⚪ Pregunta {item['numero']}: Sin contestar. (No hay respuesta correcta cargada para comparar)")
+        preguntas = st.session_state.preguntas_examen
+        total = len(preguntas)
+        modo_examen = st.session_state.get("modo_estudio", "Modo normal") == "Modo examen"
+        mostrar_origen = (st.session_state.modo_test_errores or st.session_state.modo_test_mixto)
+        viene_de_supabase = any(item.get("tabla_origen") for item in preguntas)
 
-        st.markdown("---")
+        # PANTALLA 1: PREGUNTAS DE 1 EN 1 (mientras no se haya finalizado)
+        if not st.session_state.corregido:
+            render_pregunta(modo_examen, mostrar_origen)
+            components.html(ATAJOS_TECLADO_JS, height=0)
 
-        # ¿El examen actual viene de alguna tabla de Supabase? (si es un PDF suelto, no hay
-        # tabla_origen y por tanto no se puede añadir al banco de errores)
-        viene_de_supabase = any(item.get("tabla_origen") for item in st.session_state.preguntas_examen)
+        # PANTALLA 2: RESULTADOS Y RESUMEN DE FALLOS
+        else:
+            st.subheader("📊 Resultados")
 
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("📊 Corregir Examen", type="primary", disabled=st.session_state.corregido):
-                st.session_state.corregido = True
-
-                # Si estamos haciendo el Test de errores, las preguntas ACERTADAS se borran
-                # automáticamente del banco de errores (las falladas se quedan para repasar).
-                if st.session_state.modo_test_errores:
-                    aciertos_para_borrar = []
-                    for item in st.session_state.preguntas_examen:
-                        clave = item["clave"]
-                        correcta = st.session_state.plantilla_respuestas.get(clave)
-                        marcada = st.session_state.respuestas_usuario.get(clave)
-                        if correcta and marcada == correcta:
-                            aciertos_para_borrar.append((item["tabla_origen"], item["numero"]))
-                    if aciertos_para_borrar:
-                        error_borrado = borrar_errores_acertados(aciertos_para_borrar)
-                        if error_borrado:
-                            st.toast(f"⚠️ No se pudieron borrar algunos errores: {error_borrado}")
-                        else:
-                            st.toast(f"🗑️ {len(aciertos_para_borrar)} pregunta(s) acertada(s) borradas de tu banco de errores.")
-
-                st.rerun()
-        with c2:
-            if st.button("🔄 Reiniciar Respuestas"):
-                st.session_state.respuestas_usuario = {}
-                st.session_state.corregido = False
-                st.rerun()
-        with c3:
-            # 🔒 Oculto hasta que se corrija el examen. No aparece en modo Test de errores
-            # (ese banco ya se autogestiona al corregir) ni en exámenes de PDF suelto.
-            if st.session_state.corregido and viene_de_supabase and not st.session_state.modo_test_errores:
-                if st.button("➕ Añadir errores a Test de errores"):
-                    fallos_por_tabla = {}
-                    for item in st.session_state.preguntas_examen:
-                        if not item.get("tabla_origen"):
-                            continue
-                        clave = item["clave"]
-                        correcta = st.session_state.plantilla_respuestas.get(clave)
-                        if not correcta:
-                            continue  # sin respuesta correcta cargada, no se puede evaluar
-                        marcada = st.session_state.respuestas_usuario.get(clave)
-                        # ✅ Solo se suben preguntas FALLADAS (marcada y distinta de la correcta).
-                        # Las dejadas en blanco (marcada is None) NO se añaden al banco de errores.
-                        if marcada is not None and marcada != correcta:
-                            fallos_por_tabla.setdefault(item["tabla_origen"], []).append(item["numero"])
-
-                    total_subidos = 0
-                    errores_subida = []
-                    for tabla_origen, numeros in fallos_por_tabla.items():
-                        subidos, err = registrar_errores_en_supabase(tabla_origen, numeros)
-                        if err:
-                            errores_subida.append(err)
-                        else:
-                            total_subidos += subidos
-
-                    if errores_subida:
-                        st.error("⚠️ Hubo problemas subiendo algunos errores: " + "; ".join(errores_subida))
-                    elif total_subidos:
-                        st.success(f"✅ {total_subidos} pregunta(s) añadidas a tu Test de errores.")
-                    else:
-                        st.info("🎉 No has fallado ninguna pregunta con respuesta correcta cargada, nada que añadir.")
-
-        # 📊 RESUMEN DE NOTAS (MEJORADO)
-        if st.session_state.corregido and st.session_state.preguntas_examen:
-            st.markdown("---")
-            st.subheader("📊 Resultados del Examen")
-            
-            total_preguntas = len(st.session_state.preguntas_examen)
-            
-            # ✅ SOLO las preguntas que están en el examen cargado (comparamos por "clave",
-            # que combina tabla_origen+numero para no confundir preguntas de distintas tablas
-            # con el mismo número, como puede pasar en el Test de errores)
-            numeros_examen = {p.get("clave") or str(p["numero"]) for p in st.session_state.preguntas_examen}
+            numeros_examen = {p.get("clave") or str(p["numero"]) for p in preguntas}
             plantilla_filtrada = {
-                n: r for n, r in st.session_state.plantilla_respuestas.items()
-                if n in numeros_examen
+                n: r for n, r in st.session_state.plantilla_respuestas.items() if n in numeros_examen
             }
             preguntas_con_respuesta = len(plantilla_filtrada)
-            
-            # Contar aciertos solo sobre las preguntas del examen actual
-            aciertos = sum(
-                1 for n in plantilla_filtrada.keys() 
-                if st.session_state.respuestas_usuario.get(n) == plantilla_filtrada[n]
-            )
-            
-            fallos = sum(
-                1 for n in plantilla_filtrada.keys() 
-                if st.session_state.respuestas_usuario.get(n) is not None 
-                and st.session_state.respuestas_usuario.get(n) != plantilla_filtrada[n]
-            )
-            
-            blancos = sum(
-                1 for n in plantilla_filtrada.keys() 
-                if st.session_state.respuestas_usuario.get(n) is None
-            )
-            
+            ur = st.session_state.respuestas_usuario
+
+            aciertos = sum(1 for n, r in plantilla_filtrada.items() if ur.get(n) == r)
+            fallos = sum(1 for n, r in plantilla_filtrada.items() if ur.get(n) is not None and ur.get(n) != r)
+            blancos = sum(1 for n in plantilla_filtrada if ur.get(n) is None)
+
             col1, col2, col3, col4 = st.columns(4)
             col1.metric("✅ Aciertos", aciertos)
             col2.metric("❌ Fallos", fallos)
             col3.metric("⚪ En blanco", blancos)
-            
             if preguntas_con_respuesta > 0:
-                nota = (aciertos / preguntas_con_respuesta) * 10
-                col4.metric("💯 Nota", f"{nota:.2f}/10")
+                col4.metric("💯 Nota", f"{(aciertos / preguntas_con_respuesta) * 10:.2f}/10")
+                st.progress(aciertos / preguntas_con_respuesta, text=f"{aciertos}/{preguntas_con_respuesta} correctas")
             else:
-                col4.metric("💯 Nota", "N/A", help="Sube un archivo con las respuestas correctas")
-            
-            # Barra de progreso visual
-            if preguntas_con_respuesta > 0:
-                progreso = aciertos / preguntas_con_respuesta
-                st.progress(progreso, text=f"Progreso: {aciertos}/{preguntas_con_respuesta} correctas")
-            
-            # Aviso si faltan respuestas (mostramos el número real de pregunta, no la "clave" interna)
+                col4.metric("💯 Nota", "N/A", help="No hay respuestas correctas cargadas")
+
             claves_sin_plantilla = [n for n in numeros_examen if n not in plantilla_filtrada]
             if claves_sin_plantilla:
-                numeros_sin_plantilla = sorted(
-                    item["numero"] for item in st.session_state.preguntas_examen
-                    if (item.get("clave") or str(item["numero"])) in claves_sin_plantilla
+                nums_sin = sorted(
+                    it["numero"] for it in preguntas
+                    if (it.get("clave") or str(it["numero"])) in claves_sin_plantilla
                 )
-                st.info(f"ℹ️ Preguntas sin respuesta correcta cargada: {', '.join(str(n) for n in numeros_sin_plantilla)}")
+                st.info(f"ℹ️ Preguntas sin respuesta correcta cargada: {', '.join(str(n) for n in nums_sin)}")
+
+            # ---- Resumen de preguntas falladas / en blanco ----
+            st.markdown("---")
+            st.subheader("🔍 Revisión de tus fallos")
+            hay_fallos = False
+            for it in preguntas:
+                k = it.get("clave") or str(it["numero"])
+                c = plantilla_filtrada.get(k)
+                m = ur.get(k)
+                if not c or m == c:
+                    continue
+                hay_fallos = True
+                icono = "⚪" if m is None else "❌"
+                etiqueta = f" (de {it['tabla_origen']})" if mostrar_origen and it.get("tabla_origen") else ""
+                with st.expander(f"{icono} Pregunta {it['numero']}{etiqueta}: {it['pregunta'][:90]}{'…' if len(it['pregunta']) > 90 else ''}"):
+                    st.markdown(f"**{it['pregunta']}**")
+                    for opt in it["opciones"]:
+                        letra = str(opt["letra"]).lower()
+                        texto_opt = f"{letra.upper()}) {opt['texto']}"
+                        if letra == c:
+                            st.success(texto_opt, icon="✅")
+                        elif letra == m:
+                            st.error(texto_opt + "  ← tu respuesta", icon="❌")
+                        else:
+                            with st.container(border=True):
+                                st.markdown(texto_opt)
+                    if m is None:
+                        st.warning(f"Sin contestar. La correcta era la {c.upper()}.")
+            if not hay_fallos:
+                st.success("🎉 ¡Ningún fallo ni pregunta en blanco!")
+
+            # ---- Botones finales ----
+            st.markdown("---")
+            c1, c2 = st.columns(2)
+            with c1:
+                if st.button("🔄 Repetir estas preguntas", use_container_width=True):
+                    st.session_state.respuestas_usuario = {}
+                    st.session_state.corregido = False
+                    st.session_state.idx_pregunta = 0
+                    st.rerun()
+            with c2:
+                if viene_de_supabase and not st.session_state.modo_test_errores:
+                    if st.button("➕ Añadir errores a Test de errores", use_container_width=True):
+                        fallos_por_tabla = {}
+                        for it in preguntas:
+                            if not it.get("tabla_origen"):
+                                continue
+                            k = it["clave"]
+                            c = st.session_state.plantilla_respuestas.get(k)
+                            if not c:
+                                continue
+                            m = ur.get(k)
+                            # Solo FALLADAS (contestadas y distintas de la correcta), no las en blanco
+                            if m is not None and m != c:
+                                fallos_por_tabla.setdefault(it["tabla_origen"], []).append(it["numero"])
+
+                        total_subidos = 0
+                        errores_subida = []
+                        for tabla_origen, numeros in fallos_por_tabla.items():
+                            subidos, err = registrar_errores_en_supabase(tabla_origen, numeros)
+                            if err:
+                                errores_subida.append(err)
+                            else:
+                                total_subidos += subidos
+
+                        if errores_subida:
+                            st.error("⚠️ Hubo problemas subiendo algunos errores: " + "; ".join(errores_subida))
+                        elif total_subidos:
+                            st.success(f"✅ {total_subidos} pregunta(s) añadidas a tu Test de errores.")
+                        else:
+                            st.info("🎉 No has fallado ninguna pregunta con respuesta correcta cargada, nada que añadir.")
 
 with tab2:
     if not st.session_state.texto_examen:
