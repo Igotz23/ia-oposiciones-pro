@@ -280,6 +280,84 @@ def borrar_errores_acertados(referencias):
 
 
 # =====================================================================
+# MARCADOR DE PREGUNTAS (bookmark): marcar, desmarcar y cargar
+# =====================================================================
+def obtener_preguntas_marcadas():
+    """Devuelve (conjunto de (tabla_origen, numero), error) con todas las preguntas marcadas."""
+    if supabase_client is None:
+        return None, "Supabase no está configurado."
+    try:
+        filas = supabase_client.table("preguntas_marcadas").select("tabla_origen, numero").execute().data
+        return {(f["tabla_origen"], f["numero"]) for f in filas}, None
+    except Exception as e:
+        return None, str(e)
+
+
+def alternar_marca_pregunta(tabla_origen, numero):
+    """Marca o desmarca una pregunta (toggle) en 'preguntas_marcadas'.
+    Devuelve (ahora_esta_marcada, error)."""
+    if supabase_client is None:
+        return None, "Supabase no está configurado."
+    try:
+        existe = supabase_client.table("preguntas_marcadas").select("id") \
+            .eq("tabla_origen", tabla_origen).eq("numero", numero).execute().data
+        if existe:
+            supabase_client.table("preguntas_marcadas").delete() \
+                .eq("tabla_origen", tabla_origen).eq("numero", numero).execute()
+            return False, None
+        supabase_client.table("preguntas_marcadas").insert({
+            "tabla_origen": tabla_origen,
+            "numero": numero,
+            "marcada_en": datetime.now(timezone.utc).isoformat(),
+        }).execute()
+        return True, None
+    except Exception as e:
+        return None, str(e)
+
+
+def cargar_preguntas_marcadas():
+    """Recupera todas las preguntas marcadas en 'preguntas_marcadas', trae el
+    contenido ACTUAL desde cada tabla original y devuelve (preguntas, plantilla, error)."""
+    if supabase_client is None:
+        return None, None, "Supabase no está configurado."
+    try:
+        filas = supabase_client.table("preguntas_marcadas").select("tabla_origen, numero").execute().data
+        if not filas:
+            return [], {}, None
+
+        por_tabla = {}
+        for fila in filas:
+            por_tabla.setdefault(fila["tabla_origen"], []).append(fila["numero"])
+
+        preguntas = []
+        plantilla_respuestas = {}
+        for tabla_origen, numeros in por_tabla.items():
+            respuesta = supabase_client.table(tabla_origen) \
+                .select("numero, pregunta, opciones, respuesta") \
+                .in_("numero", numeros).execute()
+            for fila in respuesta.data:
+                opciones = fila.get("opciones")
+                if isinstance(opciones, dict):
+                    opciones = [{"letra": letra, "texto": texto_opt} for letra, texto_opt in opciones.items()]
+
+                clave = f"{tabla_origen}__{fila['numero']}"
+                preguntas.append({
+                    "numero": fila["numero"],
+                    "pregunta": fila["pregunta"],
+                    "opciones": opciones,
+                    "tabla_origen": tabla_origen,
+                    "clave": clave,
+                })
+                if fila.get("respuesta"):
+                    plantilla_respuestas[clave] = str(fila["respuesta"]).lower().strip()
+
+        preguntas.sort(key=lambda p: (p["tabla_origen"], p["numero"]))
+        return preguntas, plantilla_respuestas, None
+    except Exception as e:
+        return None, None, f"No se pudieron cargar las preguntas marcadas desde Supabase: {e}"
+
+
+# =====================================================================
 # LECTURA PAGINADA Y CACHEADA (banco de preguntas, dominio e historial)
 # =====================================================================
 def _leer_tabla_completa(tabla, columnas, orden, pagina=1000):
@@ -721,6 +799,18 @@ if "confianza_usuario" not in st.session_state:
     st.session_state.confianza_usuario = {}
 if "dominio_resultado" not in st.session_state:
     st.session_state.dominio_resultado = None
+# Marcador de preguntas: conjunto de (tabla_origen, numero) marcadas con 🔖
+if "marcadas_set" not in st.session_state:
+    st.session_state.marcadas_set = set()
+if "marcadas_cargadas" not in st.session_state:
+    st.session_state["marcadas_cargadas"] = False
+
+# Cargamos el marcador desde Supabase una sola vez por sesión
+if supabase_client is not None and not st.session_state["marcadas_cargadas"]:
+    _marcadas, _err_marcadas = obtener_preguntas_marcadas()
+    if _marcadas is not None:
+        st.session_state.marcadas_set = _marcadas
+        st.session_state["marcadas_cargadas"] = True
 
 
 def reiniciar_intento():
@@ -881,6 +971,29 @@ with st.sidebar:
                 st.success(f"✅ Cargado Test de errores con {len(preguntas_error)} pregunta(s) pendientes.")
             else:
                 st.info("🎉 ¡No tienes errores guardados! Tu banco de errores está vacío.")
+
+    st.header("🔖 Preguntas marcadas")
+    st.caption("Marca preguntas con el icono 🔖 mientras las respondes y vuelve a ellas cuando quieras.")
+    if supabase_client is not None:
+        n_marcadas = len(st.session_state.marcadas_set)
+        if n_marcadas > 0:
+            st.caption(f"📌 Tienes **{n_marcadas}** pregunta(s) marcada(s).")
+        else:
+            st.caption("📌 No tienes preguntas marcadas todavía.")
+    if supabase_client is not None and st.button("🔖 Cargar Test de marcadas"):
+        with st.spinner("Consultando tus preguntas marcadas en Supabase..."):
+            preguntas_marc, plantilla_marc, error_marc = cargar_preguntas_marcadas()
+            if error_marc:
+                st.error(error_marc)
+            elif preguntas_marc:
+                st.session_state.preguntas_examen = preguntas_marc
+                reiniciar_intento()
+                st.session_state.plantilla_respuestas = plantilla_marc
+                st.session_state.modo_test_errores = False
+                st.session_state.modo_test_mixto = False
+                st.success(f"✅ Test de marcadas cargado con {len(preguntas_marc)} pregunta(s).")
+            else:
+                st.info("🔖 No tienes preguntas marcadas. Usa el icono de la esquina de cada pregunta.")
 
     st.header("🧪 Test Mixto")
     st.caption(
@@ -1274,7 +1387,36 @@ def render_pregunta(modo_examen, mostrar_origen):
     st.progress((idx + 1) / total)
 
     etiqueta_origen = f" _(de {item['tabla_origen']})_" if mostrar_origen and item.get("tabla_origen") else ""
-    st.markdown(f"#### Pregunta {item['numero']}{etiqueta_origen}")
+    ref_marca = (item.get("tabla_origen"), item["numero"])
+    es_marcada = ref_marca in st.session_state.marcadas_set
+
+    # Título + botón de marcar (como el marcador de la esquina en tu captura)
+    hcol1, hcol2 = st.columns([0.78, 0.22])
+    with hcol1:
+        st.markdown(f"#### Pregunta {item['numero']}{etiqueta_origen}")
+    with hcol2:
+        if st.button(
+            "✔ Marcada" if es_marcada else "Marcar",
+            key=f"marca_{clave}",
+            type="primary" if es_marcada else "secondary",
+            help="Marcar/desmarcar esta pregunta" if item.get("tabla_origen")
+                 else "Solo se pueden marcar preguntas cargadas desde Supabase",
+            use_container_width=True,
+        ):
+            if not item.get("tabla_origen"):
+                st.toast("⚠️ Solo se pueden marcar preguntas cargadas desde Supabase.")
+            else:
+                ahora_marcada, err_marca = alternar_marca_pregunta(*ref_marca)
+                if err_marca:
+                    st.toast(f"⚠️ Error al guardar la marca: {err_marca}")
+                else:
+                    if ahora_marcada:
+                        st.session_state.marcadas_set.add(ref_marca)
+                        st.toast("🔖 Pregunta marcada.")
+                    else:
+                        st.session_state.marcadas_set.discard(ref_marca)
+                        st.toast("📑 Marca eliminada.")
+                    _rerun_zona()
     st.markdown(f"**{item['pregunta']}**")
 
     # En modo normal, al contestar se bloquea la pregunta y se muestra la corrección al momento.
@@ -1504,12 +1646,25 @@ st.markdown("""
     justify-content: flex-start !important;
     text-align: left !important;
 }
+
+/* Botón de marcar: AMARILLO llamativo cuando la pregunta está marcada */
+[class*="st-key-marca_"] button[kind="primary"] {
+    background-color: #f1c40f !important;
+    border-color: #d4ac0d !important;
+    color: #3d3000 !important;
+    font-weight: 700 !important;
+    box-shadow: 0 0 0 3px rgba(241, 196, 15, 0.35) !important;
+}
+[class*="st-key-marca_"] button[kind="primary"] p {
+    color: #3d3000 !important;
+    font-weight: 700 !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
 # --- PANTALLA PRINCIPAL: PESTAÑAS ---
-tab1, tab2, tab_progreso, tab3 = st.tabs(
-    ["📝 Cuestionario Interactivo", "💬 Chat con el Examen", "📈 Progreso", "🔧 Diagnóstico"]
+tab1, tab2, tab_progreso, tab_marcadas, tab3 = st.tabs(
+    ["📝 Cuestionario Interactivo", "💬 Chat con el Examen", "📈 Progreso", "🔖 Marcadas", "🔧 Diagnóstico"]
 )
 
 with tab1:
@@ -1805,6 +1960,55 @@ with tab_progreso:
                     df_u.columns = ["Verdes", "Amarillas", "Rojas"]
                     st.caption("Estado actual de las preguntas según el día de su última práctica")
                     st.bar_chart(df_u, color=COLORES_ESTADO[:3])
+
+with tab_marcadas:
+    st.subheader("🔖 Tus preguntas marcadas")
+    st.caption("Aquí puedes leer todas tus preguntas marcadas, repasarlas tranquilamente y quitar marcas.")
+    if supabase_client is None:
+        st.info("Configura SUPABASE_URL y SUPABASE_KEY en tu .env para usar el marcador.")
+    else:
+        if st.button("🔄 Actualizar lista de marcadas", key="actualizar_marcadas"):
+            _marcadas_ref, _err_ref = obtener_preguntas_marcadas()
+            if _marcadas_ref is not None:
+                st.session_state.marcadas_set = _marcadas_ref
+            else:
+                st.error(_err_ref)
+            st.rerun()
+
+        if not st.session_state.marcadas_set:
+            st.info("🔖 No tienes preguntas marcadas. Usa el icono de la esquina de cada pregunta en el cuestionario.")
+        else:
+            preguntas_marc_leer, plantilla_marc_leer, error_marc_leer = cargar_preguntas_marcadas()
+            if error_marc_leer:
+                st.error(error_marc_leer)
+            elif not preguntas_marc_leer:
+                st.info("🔖 No se encontró el contenido de las preguntas marcadas (quizá se borraron de sus tablas).")
+            else:
+                st.caption(f"Tienes **{len(preguntas_marc_leer)}** pregunta(s) marcada(s).")
+                for it in preguntas_marc_leer:
+                    ref = (it["tabla_origen"], it["numero"])
+                    c = plantilla_marc_leer.get(it["clave"])
+                    titulo = f"🔖 [{it['tabla_origen']}] Pregunta {it['numero']}: " \
+                             f"{it['pregunta'][:85]}{'…' if len(it['pregunta']) > 85 else ''}"
+                    with st.expander(titulo):
+                        st.markdown(f"**{it['pregunta']}**")
+                        for opt in it["opciones"]:
+                            letra = str(opt["letra"]).lower()
+                            texto_opt = f"{letra.upper()}) {opt['texto']}"
+                            if c and letra == c:
+                                st.success(texto_opt, icon="✅")
+                            else:
+                                with st.container(border=True):
+                                    st.markdown(texto_opt)
+                        if st.button("❌ Quitar marca", key=f"quitar_marca_{it['clave']}",
+                                     use_container_width=True):
+                            _, err_quitar = alternar_marca_pregunta(*ref)
+                            if err_quitar:
+                                st.error(err_quitar)
+                            else:
+                                st.session_state.marcadas_set.discard(ref)
+                                st.toast(f"📑 Marca eliminada (pregunta {it['numero']}).")
+                                st.rerun()
 
 with tab3:
     st.subheader("🔧 Diagnóstico y Depuración")
