@@ -34,36 +34,33 @@ if SUPABASE_DISPONIBLE and os.environ.get("SUPABASE_URL") and os.environ.get("SU
 # Lista de tablas/bases de datos disponibles en Supabase. Añade aquí más según crees nuevas partes.
 TABLAS_SUPABASE_DISPONIBLES = [
     "subalterna",
-    "Aplicaciones_teorica_Parte1",
-    "Aplicaciones_teorica_Parte2",
-    "Sistemas_practica",
-    "Sistemas_teorica",
-    "Bateria_aplicaciones"
+    #"Aplicaciones_teorica_Parte1",
+    #"Aplicaciones_teorica_Parte2",
+    #"Sistemas_practica",
+    #"Sistemas_teorica",
+    #"Bateria_aplicaciones"
 ]
 
 # --- CONSTANTES DEL SISTEMA DE DOMINIO / REPASO ---
 REPASO_INTELIGENTE = "🧠 Repaso inteligente"
 REPASO_ROJAS = "🔴 Test de rojas (no las sabía)"
-REPASO_AMARILLAS = "🟡 Test de amarillas (dudas)"
 REPASO_VERDES = "🟢 Test de verdes (comprobar)"
 
 # Repasos de un solo color: modo -> estado de dominio que se selecciona
 REPASOS_POR_COLOR = {
     REPASO_ROJAS: "rojo",
-    REPASO_AMARILLAS: "amarillo",
     REPASO_VERDES: "verde",
 }
-NOMBRE_COLOR = {"rojo": "rojas", "amarillo": "amarillas", "verde": "verdes"}
+NOMBRE_COLOR = {"rojo": "rojas", "verde": "verdes"}
 
 DESCRIPCION_REPASO = {
-    REPASO_INTELIGENTE: "Prioriza rojas, da mucho peso a las amarillas, incluye algunas verdes para comprobar "
-                        "que las dominas y sube la prioridad de lo que lleva tiempo sin practicarse.",
-    REPASO_ROJAS: "Solo preguntas rojas: las que has fallado, dejado en blanco o marcado como «no lo sabía».",
-    REPASO_AMARILLAS: "Solo preguntas amarillas: las que acertaste pero con dudas o por descarte.",
+    REPASO_INTELIGENTE: "Prioriza rojas, incluye algunas verdes para comprobar que las dominas "
+                        "y sube la prioridad de lo que lleva tiempo sin practicarse.",
+    REPASO_ROJAS: "Solo preguntas rojas: las que has fallado o dejado en blanco.",
     REPASO_VERDES: "Solo preguntas verdes: las que dominas, para comprobar que no las has olvidado.",
 }
 
-COLORES_ESTADO = ["#2ecc71", "#f1c40f", "#e74c3c", "#95a5a6"]  # verde, amarillo, rojo, sin practicar
+COLORES_ESTADO = ["#2ecc71", "#e74c3c", "#95a5a6"]  # verde, rojo, sin practicar
 
 
 # --- LLAMADA A GROQ CON REINTENTOS AUTOMÁTICOS ANTE RATE LIMIT (429) ---
@@ -118,11 +115,13 @@ def parsear_seleccion_preguntas(texto_seleccion, numeros_disponibles):
     return seleccionados & disponibles
 
 
-def cargar_preguntas_desde_supabase(nombre_tabla, seleccion_texto="", orden="Orden numérico"):
+def cargar_preguntas_desde_supabase(nombre_tabla, seleccion_texto="", orden="Orden numérico", n_aleatorias=None):
     """Recupera las preguntas guardadas en una tabla de Supabase, incluyendo la respuesta
     correcta (columna 'respuesta') para poder corregir sin subir una plantilla aparte.
     Permite filtrar por número de pregunta (rangos o individuales) y elegir el orden
-    de presentación: numérico, aleatorio, o aleatorio con las opciones también desordenadas."""
+    de presentación: numérico, aleatorio, o aleatorio con las opciones también desordenadas.
+    Si n_aleatorias se indica junto a un orden aleatorio, se eligen N preguntas al azar
+    de entre las seleccionadas (ej: rango 40-80 con 5 -> salen 5 al azar de ese rango)."""
     if supabase_client is None:
         return None, None, "Supabase no está configurado."
     try:
@@ -134,6 +133,11 @@ def cargar_preguntas_desde_supabase(nombre_tabla, seleccion_texto="", orden="Ord
         numeros_disponibles = [fila["numero"] for fila in filas if fila.get("numero") is not None]
         numeros_seleccionados = parsear_seleccion_preguntas(seleccion_texto, numeros_disponibles)
         filas_filtradas = [fila for fila in filas if fila.get("numero") in numeros_seleccionados]
+
+        # 🎲 NUEVO: si hay orden aleatorio y se pidió un número concreto, muestreamos N al azar
+        es_orden_aleatorio = orden in ("Orden aleatorio", "Orden aleatorio y respuestas desordenadas")
+        if es_orden_aleatorio and n_aleatorias:
+            filas_filtradas = random.sample(filas_filtradas, min(n_aleatorias, len(filas_filtradas)))
 
         preguntas = []
         plantilla_respuestas = {}
@@ -595,12 +599,12 @@ def _repartir_por_cuotas(grupos, cuotas, prioridad, n, estados):
 
 def seleccionar_referencias_repaso(modo, n, pool, estados):
     """Devuelve (lista de (tabla, numero), aviso). Solo se consideran preguntas que existen en el banco."""
-    grupos = {"rojo": [], "amarillo": [], "verde": [], "nuevo": []}
+    grupos = {"rojo": [], "verde": [], "nuevo": []}
     for ref in pool:
         info = estados.get(ref)
         grupos[info["estado"] if info and info.get("estado") in grupos else "nuevo"].append(ref)
 
-    hay_estados = bool(grupos["rojo"] or grupos["amarillo"] or grupos["verde"])
+    hay_estados = bool(grupos["rojo"] or grupos["verde"])
 
     # Repaso de un solo color (rojas / amarillas / verdes)
     if modo in REPASOS_POR_COLOR:
@@ -613,8 +617,8 @@ def seleccionar_referencias_repaso(modo, n, pool, estados):
         return refs, None
 
     if modo == REPASO_INTELIGENTE:
-        cuotas = {"rojo": 0.45, "amarillo": 0.30, "verde": 0.15, "nuevo": 0.10}
-        prioridad = ["rojo", "amarillo", "nuevo", "verde"]
+        cuotas = {"rojo": 0.50, "verde": 0.20, "nuevo": 0.30}
+        prioridad = ["rojo", "nuevo", "verde"]
         refs = _repartir_por_cuotas(grupos, cuotas, prioridad, n, estados)
         aviso = None if hay_estados else "Aún no tienes estados registrados en esta tabla: el test es aleatorio."
         return refs, aviso
@@ -654,24 +658,17 @@ def cargar_test_repaso(modo, n_preguntas, tabla):
 # =====================================================================
 # SISTEMA DE DOMINIO: CÁLCULO Y GUARDADO DEL ESTADO
 # =====================================================================
-def calcular_estado(marcada, correcta, confianza):
-    """Seguridad declarada: 'alta' (🟢 lo sabía), 'baja' (🟡 dudé / descarte), 'nula' (🔴 no lo sabía).
-    Incorrecta o en blanco = rojo. Correcta + alta = verde, correcta + baja = amarillo,
-    correcta + nula = rojo (acertó por suerte, no lo sabía).
+def calcular_estado(marcada, correcta):
+    """Correcta = verde. Incorrecta o en blanco = rojo.
     Sin respuesta correcta disponible -> None (no se guarda nada)."""
     if not correcta:
         return None
     if marcada is None or marcada != correcta:
         return "rojo"
-    if confianza == "alta":
-        return "verde"
-    if confianza == "nula":
-        return "rojo"
-    # 'baja' o sin indicar: opción conservadora (amarillo)
-    return "amarillo"
+    return "verde"
 
 
-def guardar_dominio_test(preguntas, plantilla, respuestas, confianza):
+def guardar_dominio_test(preguntas, plantilla, respuestas):
     """Actualiza 'dominio_preguntas' con el resultado del test. Devuelve (resumen, error).
     - Solo preguntas con tabla_origen (las de PDF suelto se ignoran) y con respuesta correcta cargada.
     - Una única operación upsert por (tabla_origen, numero): nunca duplica registros.
@@ -685,7 +682,7 @@ def guardar_dominio_test(preguntas, plantilla, respuestas, confianza):
         if not tabla:
             continue
         k = it["clave"]
-        estado = calcular_estado(respuestas.get(k), plantilla.get(k), confianza.get(k))
+        estado = calcular_estado(respuestas.get(k), plantilla.get(k))
         if estado is None:
             continue
         nuevos[(tabla, it["numero"])] = estado
@@ -735,7 +732,6 @@ def guardar_dominio_test(preguntas, plantilla, respuestas, confianza):
     resumen = {
         "n": len(nuevos),
         "verde": sum(1 for e in nuevos.values() if e == "verde"),
-        "amarillo": sum(1 for e in nuevos.values() if e == "amarillo"),
         "rojo": sum(1 for e in nuevos.values() if e == "rojo"),
     }
     return resumen, None
@@ -750,7 +746,6 @@ def ejecutar_guardado_dominio():
         st.session_state.preguntas_examen,
         st.session_state.plantilla_respuestas,
         st.session_state.respuestas_usuario,
-        st.session_state.confianza_usuario,
     )
     if error:
         st.session_state.dominio_resultado = {"ok": False, "error": error}
@@ -794,9 +789,7 @@ if "modo_test_mixto" not in st.session_state:
     st.session_state.modo_test_mixto = False
 if "idx_pregunta" not in st.session_state:
     st.session_state.idx_pregunta = 0
-# Sistema de dominio: seguridad declarada por pregunta ({clave: 'alta'|'baja'}) y resultado del guardado
-if "confianza_usuario" not in st.session_state:
-    st.session_state.confianza_usuario = {}
+# Sistema de dominio: resultado del guardado
 if "dominio_resultado" not in st.session_state:
     st.session_state.dominio_resultado = None
 # Marcador de preguntas: conjunto de (tabla_origen, numero) marcadas con 🔖
@@ -814,9 +807,8 @@ if supabase_client is not None and not st.session_state["marcadas_cargadas"]:
 
 
 def reiniciar_intento():
-    """Deja a cero un intento (respuestas, seguridad, corrección y resultado de dominio)."""
+    """Deja a cero un intento (respuestas, corrección y resultado de dominio)."""
     st.session_state.respuestas_usuario = {}
-    st.session_state.confianza_usuario = {}
     st.session_state.dominio_resultado = None
     st.session_state.corregido = False
     st.session_state.idx_pregunta = 0
@@ -871,7 +863,7 @@ with st.sidebar:
     st.markdown("**🎯 Repasar preguntas de esta tabla:**")
     tipo_repaso = st.radio(
         "tipo_repaso_radio",
-        options=[REPASO_INTELIGENTE, REPASO_ROJAS, REPASO_AMARILLAS, REPASO_VERDES],
+        options=[REPASO_INTELIGENTE, REPASO_ROJAS, REPASO_VERDES],
         key="tipo_repaso",
         label_visibility="collapsed",
     )
@@ -926,10 +918,25 @@ with st.sidebar:
         label_visibility="collapsed"
     )
 
+    # 🎲 NUEVO: número de preguntas aleatorias sobre la selección (solo con orden aleatorio)
+    n_aleatorias_rango = None
+    if orden_preguntas != "Orden numérico":
+        usar_n_aleatorias = st.checkbox(
+            "🎲 Elegir solo N preguntas al azar de la selección",
+            key="usar_n_aleatorias",
+            help="Ej: rango 40-80 con 5 preguntas -> salen 5 elegidas al azar de ese rango (p. ej. 45, 72, 49...)"
+        )
+        if usar_n_aleatorias:
+            n_aleatorias_rango = st.number_input(
+                "¿Cuántas preguntas aleatorias quieres?",
+                min_value=1, max_value=500, value=10, step=1,
+                key="n_aleatorias_rango"
+            )
+
     if supabase_client is not None and st.button("☁️ Cargar preguntas guardadas de esta tabla"):
         with st.spinner(f"Consultando '{tabla_seleccionada}' en Supabase..."):
             preguntas_supabase, plantilla_supabase, error_supabase = cargar_preguntas_desde_supabase(
-                tabla_seleccionada, seleccion_preguntas_texto, orden_preguntas
+                tabla_seleccionada, seleccion_preguntas_texto, orden_preguntas, n_aleatorias_rango
             )
             if error_supabase:
                 st.error(error_supabase)
@@ -942,6 +949,8 @@ with st.sidebar:
                 # de subir una plantilla de respuestas aparte.
                 st.session_state.plantilla_respuestas = plantilla_supabase
                 mensaje = f"✅ Cargadas {len(preguntas_supabase)} preguntas desde Supabase"
+                if n_aleatorias_rango and len(preguntas_supabase) < n_aleatorias_rango:
+                    mensaje += f" (pediste {n_aleatorias_rango}, pero solo había {len(preguntas_supabase)} en esa selección)"
                 if plantilla_supabase:
                     mensaje += f" (con {len(plantilla_supabase)} respuestas correctas listas para corregir)."
                 else:
@@ -1027,36 +1036,36 @@ with st.sidebar:
 
     st.header("📥 Carga del Examen")
     uploaded_file = st.file_uploader("Sube el PDF del examen (Digital o Escaneado)", type="pdf")
-    
+
     st.header("📝 Carga de Respuestas Correctas")
     uploaded_respuestas = st.file_uploader(
         "Sube imagen (PNG/JPG) o PDF con las respuestas correctas", 
         type=["png", "jpg", "jpeg", "pdf"]
     )
-    
+
     if uploaded_respuestas is not None and st.button("🔍 Leer Respuestas Correctas"):
         with st.spinner("Leyendo archivo de respuestas..."):
             try:
                 resp_bytes = uploaded_respuestas.read()
                 texto_respuestas = ""
-                
+
                 # Si es PDF, intentar extraer texto primero
                 if uploaded_respuestas.name.lower().endswith(".pdf"):
                     reader = PdfReader(BytesIO(resp_bytes))
                     for page in reader.pages:
                         texto_respuestas += page.extract_text() or ""
-                
+
                 # Si no hay texto o es imagen, usar visión
                 if not texto_respuestas.strip():
                     st.info("📸 Usando IA de Visión para leer respuestas...")
-                    
+
                     # Convertir a imagen si es PDF, o usar directamente si es imagen
                     if uploaded_respuestas.name.lower().endswith(".pdf"):
                         paginas = convert_from_bytes(resp_bytes, poppler_path=r"C:\poppler\bin")
                         imagenes = paginas
                     else:
                         imagenes = [Image.open(BytesIO(resp_bytes))]
-                    
+
                     for i, img in enumerate(imagenes):
                         # CORRECCIÓN: Convertir a RGB antes de guardar como JPEG
                         img_rgb = convertir_a_jpeg(img)
@@ -1064,7 +1073,7 @@ with st.sidebar:
                         buffered = BytesIO()
                         img_rgb.save(buffered, format="JPEG", quality=75)
                         img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                        
+
                         prompt_resp = (
                             "Extrae ÚNICAMENTE las respuestas correctas de este documento. "
                             "Devuélvelo en formato JSON como un objeto donde la clave es el número de pregunta "
@@ -1072,7 +1081,7 @@ with st.sidebar:
                             "Ejemplo: {\"1\": \"a\", \"2\": \"c\", \"3\": \"b\"}. "
                             "NO incluyas explicaciones, solo el JSON puro."
                         )
-                        
+
                         response = groq_completion_con_reintentos(client,
                             model="qwen/qwen3.6-27b",
                             messages=[{
@@ -1085,9 +1094,9 @@ with st.sidebar:
                             temperature=0
                         )
                         texto_respuestas += response.choices[0].message.content + "\n"
-                
+
                 st.session_state.texto_respuestas = texto_respuestas
-                
+
                 # Extraer JSON de la respuesta
                 json_match = re.search(r'\{.*\}', texto_respuestas, re.DOTALL)
                 if json_match:
@@ -1099,15 +1108,15 @@ with st.sidebar:
                         st.warning("⚠️ No se pudo parsear el JSON. Revisa la pestaña de diagnóstico.")
                 else:
                     st.warning("⚠️ No se encontró JSON en la respuesta. Revisa la pestaña de diagnóstico.")
-                    
+
             except Exception as e:
                 st.error(f"Error leyendo respuestas: {e}")
-    
+
     # Mostrar respuestas cargadas
     if st.session_state.plantilla_respuestas:
         with st.expander("📋 Ver respuestas correctas cargadas"):
             st.json(st.session_state.plantilla_respuestas)
-    
+
     if uploaded_file is not None and st.button("🚀 Procesar Examen"):
         with st.spinner("Analizando documento..."):
             try:
@@ -1118,17 +1127,17 @@ with st.sidebar:
                 texto_completo = ""
                 for page in reader.pages:
                     texto_completo += page.extract_text() or ""
-                
+
                 # 2. Si no hay texto, ¡es un PDF escaneado! Activamos la IA de Visión y Poppler
                 if not texto_completo.strip():
                     st.info("📸 PDF escaneado detectado. Convirtiendo páginas a imágenes con Poppler...")
-                    
+
                     paginas_imagenes = convert_from_bytes(file_bytes, poppler_path=r"C:\poppler\bin")
-                    
+
                     st.write(f"Procesando {len(paginas_imagenes)} páginas con Visión artificial...")
-                    
+
                     texto_completo = ""
-                    
+
                     for i, pagina in enumerate(paginas_imagenes):
                         with st.spinner(f"Leyendo página {i+1}..."):
                             # CORRECCIÓN: Convertir a RGB antes de guardar como JPEG
@@ -1137,13 +1146,13 @@ with st.sidebar:
                             buffered = BytesIO()
                             pagina_rgb.save(buffered, format="JPEG", quality=75)
                             img_base64 = base64.b64encode(buffered.getvalue()).decode('utf-8')
-                            
+
                             prompt_vision = (
                                 "Transcribe de forma LITERAL todo el texto que veas en esta página de examen, "
                                 "incluyendo los números de pregunta, enunciados y las opciones de respuesta (a, b, c, d). "
                                 "No agregues comentarios propios ni introducciones."
                             )
-                            
+
                             response_vision = groq_completion_con_reintentos(client,
                                 model="qwen/qwen3.6-27b",
                                 messages=[{
@@ -1157,7 +1166,7 @@ with st.sidebar:
                             )
                             # CORREGIDO: era response_choices[0], ahora response_vision.choices[0]
                             texto_completo += response_vision.choices[0].message.content + "\n"
-                
+
                 st.session_state.texto_examen = texto_completo
 
                 # --- FUNCIÓN AUXILIAR: TROCEAR EL TEXTO RESPETANDO PREGUNTAS COMPLETAS ---
@@ -1376,14 +1385,8 @@ def render_pregunta(modo_examen, mostrar_origen):
     clave = item.get("clave") or str(item["numero"])
     marcada = st.session_state.respuestas_usuario.get(clave)
     correcta = st.session_state.plantilla_respuestas.get(clave)
-    confianza = st.session_state.confianza_usuario.get(clave)
 
-    # La autoevaluación de seguridad solo tiene sentido si la pregunta puede guardarse en el
-    # sistema de dominio: viene de una tabla de Supabase Y hay respuesta correcta cargada.
-    pedir_confianza = bool(item.get("tabla_origen")) and bool(correcta)
-    pendiente_confianza = pedir_confianza and marcada is not None and confianza is None
-
-    st.caption(("📝 MODO EXAMEN" if modo_examen else "📖 MODO NORMAL") + f"  ·  Pregunta {idx + 1} de {total}  ·  ⌨️ 1-4 responder · 5/6/7 seguridad · ← → navegar")
+    st.caption(("📝 MODO EXAMEN" if modo_examen else "📖 MODO NORMAL") + f"  ·  Pregunta {idx + 1} de {total}  ·  ⌨️ 1-4 responder · ← → navegar")
     st.progress((idx + 1) / total)
 
     etiqueta_origen = f" _(de {item['tabla_origen']})_" if mostrar_origen and item.get("tabla_origen") else ""
@@ -1420,9 +1423,8 @@ def render_pregunta(modo_examen, mostrar_origen):
     st.markdown(f"**{item['pregunta']}**")
 
     # En modo normal, al contestar se bloquea la pregunta y se muestra la corrección al momento.
-    # La seguridad (🟢🟡🔴) es opcional: si no eliges, al pasar de pregunta se marca 🟢.
     bloqueada = (not modo_examen) and marcada is not None
-    revelar = bloqueada  # en modo normal la corrección sale al instante, sin esperar a la seguridad
+    revelar = bloqueada  # en modo normal la corrección sale al instante
 
     for opt in item["opciones"]:
         letra = str(opt["letra"]).lower()
@@ -1454,58 +1456,11 @@ def render_pregunta(modo_examen, mostrar_origen):
                 type="primary" if (modo_examen and es_marcada) else "secondary",
             ):
                 st.session_state.respuestas_usuario[clave] = letra
-                # Si cambia la respuesta (modo examen), la seguridad anterior ya no vale
-                st.session_state.confianza_usuario.pop(clave, None)
                 _rerun_zona()
-
-    # --- Autoevaluación de seguridad ---
-    if pedir_confianza and marcada is not None:
-        if True:
-            st.markdown("**¿Cómo de seguro estabas de tu respuesta?**")
-            cc1, cc2, cc3 = st.columns(3)
-            with cc1:
-                if st.button(
-                    "🟢 Lo sabía",
-                    key=f"conf_verde_{clave}",
-                    type="primary" if (confianza or "alta") == "alta" else "secondary",
-                    use_container_width=True,
-                    help="Sabía explicar por qué era correcta.",
-                ):
-                    st.session_state.confianza_usuario[clave] = "alta"
-                    _rerun_zona()
-            with cc2:
-                if st.button(
-                    "🟡 Dudé / descarte",
-                    key=f"conf_amarillo_{clave}",
-                    type="primary" if confianza == "baja" else "secondary",
-                    use_container_width=True,
-                    help="He dudado o he respondido por descarte.",
-                ):
-                    st.session_state.confianza_usuario[clave] = "baja"
-                    _rerun_zona()
-            with cc3:
-                if st.button(
-                    "🔴 No lo sabía",
-                    key=f"conf_rojo_{clave}",
-                    type="primary" if confianza == "nula" else "secondary",
-                    use_container_width=True,
-                    help="No sabía la respuesta (aunque la hayas acertado, contará como roja).",
-                ):
-                    st.session_state.confianza_usuario[clave] = "nula"
-                    _rerun_zona()
-            if confianza is None:
-                st.caption("Si pasas a la siguiente sin elegir, se marcará 🟢 Lo sabía por defecto.")
-        else:
-            st.caption({
-                "alta": "🟢 Seguridad indicada: lo sabía",
-                "baja": "🟡 Seguridad indicada: dudé / descarte",
-                "nula": "🔴 Seguridad indicada: no lo sabía",
-            }.get(confianza, ""))
 
     if modo_examen and marcada is not None:
         if st.button("✖️ Borrar mi respuesta", key=f"borrar_{clave}"):
             del st.session_state.respuestas_usuario[clave]
-            st.session_state.confianza_usuario.pop(clave, None)
             _rerun_zona()
 
     st.markdown("---")
@@ -1513,8 +1468,6 @@ def render_pregunta(modo_examen, mostrar_origen):
     nav1, nav2 = st.columns(2)
     with nav1:
         if st.button("‹ Anterior", disabled=(idx == 0), use_container_width=True):
-            if pendiente_confianza:
-                st.session_state.confianza_usuario[clave] = "alta"
             st.session_state.idx_pregunta = idx - 1
             _rerun_zona()
     with nav2:
@@ -1522,15 +1475,10 @@ def render_pregunta(modo_examen, mostrar_origen):
             destacar = modo_examen or marcada is not None
             if st.button("Siguiente ›", type="primary" if destacar else "secondary",
                          use_container_width=True):
-                # Si no elegiste seguridad, se marca 🟢 "Lo sabía" automáticamente
-                if pendiente_confianza:
-                    st.session_state.confianza_usuario[clave] = "alta"
                 st.session_state.idx_pregunta = idx + 1
                 _rerun_zona()
         else:
             if st.button("🏁 Finalizar y ver resultados", type="primary", use_container_width=True):
-                if pendiente_confianza:
-                    st.session_state.confianza_usuario[clave] = "alta"
                 st.session_state.corregido = True
 
                 # Sistema de dominio: actualiza dominio_preguntas (independiente del banco de errores)
@@ -1572,14 +1520,10 @@ ATAJOS_TECLADO_JS = """
     const buscar = f => botones.find(b => f((b.innerText || '').trim()));
     let b = null;
     if (['1', '2', '3', '4'].includes(e.key)) {
-      const letra = 'ABCD'[parseInt(e.key) - 1];
-      b = buscar(txt => txt.startsWith(letra + ')'));
-    } else if (e.key === '5') {
-      b = buscar(txt => txt.includes('🟢') && txt.includes('Lo sabía'));
-    } else if (e.key === '6') {
-      b = buscar(txt => txt.includes('🟡') && txt.includes('Dudé'));
-    } else if (e.key === '7') {
-      b = buscar(txt => txt.includes('🔴') && txt.includes('No lo sabía'));
+      // Las opciones pueden estar desordenadas: 1-4 responde la opción que se ve
+      // en esa posición (la 1ª de arriba, la 2ª...), sin importar su letra.
+      const opciones = botones.filter(bb => /^[A-D][)]/.test((bb.innerText || '').trim()));
+      b = opciones[parseInt(e.key) - 1];
     } else if (e.key === 'ArrowRight') {
       b = buscar(txt => txt.includes('Siguiente'));
     } else if (e.key === 'ArrowLeft') {
@@ -1630,14 +1574,6 @@ st.markdown("""
     letter-spacing: 0.04em;
     text-transform: uppercase;
 }
-
-/* Botones de seguridad: verde / amarillo / rojo (el seleccionado se ve a pleno color) */
-[class*="st-key-conf_verde_"] button { background-color: #2ecc71 !important; border-color: #27ae60 !important; color: #06310f !important; }
-[class*="st-key-conf_amarillo_"] button { background-color: #f1c40f !important; border-color: #d4ac0d !important; color: #3d3000 !important; }
-[class*="st-key-conf_rojo_"] button { background-color: #e74c3c !important; border-color: #c0392b !important; color: #ffffff !important; }
-[class*="st-key-conf_"] button p { font-weight: 700 !important; color: inherit !important; }
-[class*="st-key-conf_"] button[kind="secondary"] { opacity: 0.55; }
-[class*="st-key-conf_"] button[kind="primary"] { opacity: 1; box-shadow: 0 0 0 3px rgba(0,0,0,0.25); }
 
 /* Todas las opciones empiezan en el mismo punto de la izquierda */
 [class*="st-key-opt_"] button,
@@ -1723,7 +1659,7 @@ with tab1:
                     rs = resultado_dominio["resumen"]
                     st.success(
                         f"🧭 Dominio actualizado en {rs['n']} pregunta(s): "
-                        f"🟢 {rs['verde']} · 🟡 {rs['amarillo']} · 🔴 {rs['rojo']}"
+                        f"🟢 {rs['verde']} · 🔴 {rs['rojo']}"
                     )
                 else:
                     st.warning(f"⚠️ No se pudo guardar tu progreso de dominio: {resultado_dominio.get('error')}")
@@ -1805,11 +1741,11 @@ with tab2:
         st.info("👋 Sube un examen primero para poder hacerle preguntas libres.")
     else:
         st.subheader("💬 Chat con el Examen")
-        
+
         for chat in st.session_state.historial_chat:
             with st.chat_message(chat["role"]):
                 st.markdown(chat["content"])
-        
+
         if pregunta_usuario := st.chat_input("Ej: ¿Qué dice la pregunta 1?"):
             with st.chat_message("user"):
                 st.markdown(pregunta_usuario)
@@ -1827,7 +1763,7 @@ with tab2:
             # Solo los últimos mensajes del historial, para no acumular contexto indefinidamente
             for chat in st.session_state.historial_chat[-6:]:
                 prompt_chat.append(chat)
-                
+
             with st.chat_message("assistant"):
                 with st.spinner("Pensando..."):
                     completion_chat = groq_completion_con_reintentos(client,
@@ -1838,7 +1774,7 @@ with tab2:
                     )
                     respuesta_chat = completion_chat.choices[0].message.content
                     st.markdown(respuesta_chat)
-            
+
             st.session_state.historial_chat.append({"role": "assistant", "content": respuesta_chat})
 
 # --- PESTAÑA: PANEL DE PROGRESO ---
@@ -1862,24 +1798,22 @@ with tab_progreso:
         elif not pool_p:
             st.info("No hay preguntas en las tablas configuradas.")
         else:
-            conteo_tablas = {t: {"verde": 0, "amarillo": 0, "rojo": 0, "nuevo": 0} for t in TABLAS_SUPABASE_DISPONIBLES}
+            conteo_tablas = {t: {"verde": 0, "rojo": 0, "nuevo": 0} for t in TABLAS_SUPABASE_DISPONIBLES}
             for ref in pool_p:
                 info = estados_p.get(ref)
-                estado = info["estado"] if info and info.get("estado") in ("verde", "amarillo", "rojo") else "nuevo"
+                estado = info["estado"] if info and info.get("estado") in ("verde", "rojo") else "nuevo"
                 conteo_tablas[ref[0]][estado] += 1
 
             n_verde = sum(c["verde"] for c in conteo_tablas.values())
-            n_amarillo = sum(c["amarillo"] for c in conteo_tablas.values())
             n_rojo = sum(c["rojo"] for c in conteo_tablas.values())
             n_nuevo = sum(c["nuevo"] for c in conteo_tablas.values())
             n_total = len(pool_p)
 
-            m1, m2, m3, m4, m5 = st.columns(5)
+            m1, m2, m3, m4 = st.columns(4)
             m1.metric("📚 Total", n_total)
             m2.metric("🟢 Verdes", n_verde)
-            m3.metric("🟡 Amarillas", n_amarillo)
-            m4.metric("🔴 Rojas", n_rojo)
-            m5.metric("⚪ Sin practicar", n_nuevo)
+            m3.metric("🔴 Rojas", n_rojo)
+            m4.metric("⚪ Sin practicar", n_nuevo)
             st.progress(n_verde / n_total, text=f"{n_verde / n_total * 100:.1f}% del banco dominado (verde)")
             st.progress((n_total - n_nuevo) / n_total, text=f"{(n_total - n_nuevo) / n_total * 100:.1f}% del banco practicado")
 
@@ -1890,7 +1824,6 @@ with tab_progreso:
                     {
                         "Tabla": t,
                         "Verdes": c["verde"],
-                        "Amarillas": c["amarillo"],
                         "Rojas": c["rojo"],
                         "Sin practicar": c["nuevo"],
                     }
@@ -1898,7 +1831,7 @@ with tab_progreso:
                 ]
             ).set_index("Tabla")
             df_tablas["Total"] = df_tablas.sum(axis=1)
-            st.bar_chart(df_tablas[["Verdes", "Amarillas", "Rojas", "Sin practicar"]], color=COLORES_ESTADO)
+            st.bar_chart(df_tablas[["Verdes", "Rojas", "Sin practicar"]], color=COLORES_ESTADO)
             st.dataframe(df_tablas, use_container_width=True)
 
             # ---- Evolución en el tiempo ----
@@ -1924,19 +1857,19 @@ with tab_progreso:
                         st.metric("🟢 % de respuestas en verde (últimos 7 días)", f"{pct_ult:.1f}%")
 
                 por_dia = df_h.groupby(["dia", "estado"]).size().unstack(fill_value=0)
-                for col in ["verde", "amarillo", "rojo"]:
+                for col in ["verde", "rojo"]:
                     if col not in por_dia.columns:
                         por_dia[col] = 0
-                por_dia = por_dia[["verde", "amarillo", "rojo"]].sort_index()
+                por_dia = por_dia[["verde", "rojo"]].sort_index()
 
                 porcentajes = por_dia.div(por_dia.sum(axis=1), axis=0) * 100
-                porcentajes.columns = ["% verdes", "% amarillas", "% rojas"]
+                porcentajes.columns = ["% verdes", "% rojas"]
                 st.caption("Porcentaje de respuestas de cada color en los intentos de cada día")
-                st.line_chart(porcentajes, color=COLORES_ESTADO[:3])
+                st.line_chart(porcentajes, color=COLORES_ESTADO[:2])
 
-                por_dia.columns = ["Verdes", "Amarillas", "Rojas"]
+                por_dia.columns = ["Verdes", "Rojas"]
                 st.caption("Preguntas practicadas por día")
-                st.bar_chart(por_dia, color=COLORES_ESTADO[:3])
+                st.bar_chart(por_dia, color=COLORES_ESTADO[:2])
             else:
                 if error_historial_p:
                     st.info(
@@ -1953,13 +1886,13 @@ with tab_progreso:
                 ]
                 if filas_ult:
                     df_u = pd.DataFrame(filas_ult).groupby(["dia", "estado"]).size().unstack(fill_value=0)
-                    for col in ["verde", "amarillo", "rojo"]:
+                    for col in ["verde", "rojo"]:
                         if col not in df_u.columns:
                             df_u[col] = 0
-                    df_u = df_u[["verde", "amarillo", "rojo"]].sort_index()
-                    df_u.columns = ["Verdes", "Amarillas", "Rojas"]
+                    df_u = df_u[["verde", "rojo"]].sort_index()
+                    df_u.columns = ["Verdes", "Rojas"]
                     st.caption("Estado actual de las preguntas según el día de su última práctica")
-                    st.bar_chart(df_u, color=COLORES_ESTADO[:3])
+                    st.bar_chart(df_u, color=COLORES_ESTADO[:2])
 
 with tab_marcadas:
     st.subheader("🔖 Tus preguntas marcadas")
@@ -2012,25 +1945,22 @@ with tab_marcadas:
 
 with tab3:
     st.subheader("🔧 Diagnóstico y Depuración")
-    
+
     with st.expander("📄 Texto del examen transcrito"):
         st.text_area("Contenido:", value=st.session_state.texto_examen, height=300, key="diag_texto_examen")
-    
+
     with st.expander("📄 Texto de respuestas correctas (raw)"):
         st.text_area("Contenido:", value=st.session_state.texto_respuestas, height=200, key="diag_texto_respuestas")
-    
+
     with st.expander("🧩 Última respuesta JSON del modelo (estructuración de preguntas)"):
         st.text_area("Contenido:", value=st.session_state.ultima_respuesta_estructuracion, height=200, key="diag_ultima_respuesta_json")
 
     with st.expander("📋 Plantilla de respuestas parseada"):
         st.json(st.session_state.plantilla_respuestas)
-    
+
     with st.expander("👤 Respuestas del usuario"):
         st.json(st.session_state.respuestas_usuario)
 
-    with st.expander("🎚️ Seguridad declarada por pregunta"):
-        st.json(st.session_state.confianza_usuario)
-    
     if st.button("🗑️ Limpiar todo"):
         for key in list(st.session_state.keys()):
             del st.session_state[key]
