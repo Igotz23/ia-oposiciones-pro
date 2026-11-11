@@ -60,6 +60,10 @@ DESCRIPCION_REPASO = {
     REPASO_VERDES: "Solo preguntas verdes: las que dominas, para comprobar que no las has olvidado.",
 }
 
+# --- REGLAS DEL RANKING DE MÁS FALLADAS ---
+MIN_FALLOS_MAS_FALLADAS = 3      # una pregunta solo aparece a partir de este nº de fallos acumulados
+RACHA_ACIERTOS_PARA_QUITAR = 5   # si tus últimos N intentos de esa pregunta son todos aciertos, sale del ranking
+
 COLORES_ESTADO = ["#2ecc71", "#e74c3c", "#95a5a6"]  # verde, rojo, sin practicar
 
 
@@ -445,6 +449,73 @@ def _limpiar_caches_dominio():
 
 
 # =====================================================================
+# PREGUNTAS MÁS FALLADAS (ranking acumulado a lo largo del tiempo)
+# =====================================================================
+def calcular_mas_falladas():
+    """Ranking acumulado de preguntas por nº de veces que han salido en ROJO (falladas o en blanco).
+    Se calcula desde 'historial_dominio', que registra CADA intento de CADA test y nunca se borra.
+    Reglas:
+      - Solo entran preguntas con al menos MIN_FALLOS_MAS_FALLADAS fallos acumulados.
+      - Salen del ranking si tus últimos RACHA_ACIERTOS_PARA_QUITAR intentos de esa pregunta fueron aciertos.
+    Devuelve ([(tabla, numero, veces), ...] de más a menos falladas, error)."""
+    historial, error = obtener_historial()
+    if error:
+        return None, error
+
+    intentos = {}   # ref -> lista de (fecha, estado)
+    for h in historial:
+        ref = (h["tabla_origen"], h["numero"])
+        intentos.setdefault(ref, []).append((str(h.get("fecha") or ""), h.get("estado")))
+
+    cuentas = {}
+    ultima = {}
+    for ref, lista in intentos.items():
+        lista.sort(key=lambda x: x[0])  # de más antiguo a más reciente
+        fallos = sum(1 for _, est in lista if est == "rojo")
+        if fallos < MIN_FALLOS_MAS_FALLADAS:
+            continue
+        ultimos = lista[-RACHA_ACIERTOS_PARA_QUITAR:]
+        if len(ultimos) == RACHA_ACIERTOS_PARA_QUITAR and all(est == "verde" for _, est in ultimos):
+            continue  # ya la dominas: 5 aciertos seguidos
+        cuentas[ref] = fallos
+        ultima[ref] = max((f for f, est in lista if est == "rojo"), default="")
+
+    # Orden: más veces primero; a igualdad de veces, la fallada más recientemente primero
+    refs = sorted(cuentas, key=lambda r: ultima.get(r, ""), reverse=True)
+    refs.sort(key=lambda r: cuentas[r], reverse=True)
+    return [(t, n, cuentas[(t, n)]) for (t, n) in refs], None
+
+
+@st.cache_data(ttl=600, show_spinner=False)
+def _contenido_preguntas_cacheado(referencias):
+    """Contenido de una lista de referencias (tupla de (tabla, numero)), cacheado para que
+    la pestaña no consulte Supabase en cada recarga."""
+    return traer_preguntas_por_referencias(list(referencias))
+
+
+def cargar_test_mas_falladas(n_preguntas):
+    """Test con las N preguntas más falladas de todos los tiempos (ordenadas de más a menos falladas).
+    Si hay menos de N preguntas con algún fallo, se usan las que haya."""
+    if supabase_client is None:
+        return None, None, 0, "Supabase no está configurado."
+    try:
+        ranking, error = calcular_mas_falladas()
+        if error:
+            return None, None, 0, f"No se pudo leer tu historial: {error}"
+        if not ranking:
+            return [], {}, 0, None
+        top = ranking[:n_preguntas]
+        refs = [(t, n) for t, n, _ in top]
+        preguntas, plantilla = traer_preguntas_por_referencias(refs)
+        posicion = {ref: i for i, ref in enumerate(refs)}
+        preguntas.sort(key=lambda p: posicion.get((p["tabla_origen"], p["numero"]), 10**9))
+        return preguntas, plantilla, len(preguntas), None
+    except Exception as e:
+        return None, None, 0, f"No se pudo generar el Test de más falladas: {e}"
+
+
+
+# =====================================================================
 # CARGA DE PREGUNTAS POR REFERENCIA (tabla, numero)
 # =====================================================================
 def traer_preguntas_por_referencias(referencias):
@@ -755,8 +826,8 @@ def ejecutar_guardado_dominio():
         st.session_state.dominio_resultado = None
 
 
-st.set_page_config(page_title="IA Oposiciones - Escaneados Pro", layout="wide")
-st.title("🛡️ Sistema Inteligente de Exámenes (Soporta PDFs Escaneados)")
+st.set_page_config(page_title=" Oposiciones - Escaneados Pro", layout="wide")
+#st.title("🛡️ Sistema Inteligente de Exámenes (Soporta PDFs Escaneados)")
 
 # --- INICIALIZAR CLIENTE DE GROQ DIRECTO ---
 if "GROQ_API_KEY" in os.environ:
@@ -980,6 +1051,41 @@ with st.sidebar:
                 st.success(f"✅ Cargado Test de errores con {len(preguntas_error)} pregunta(s) pendientes.")
             else:
                 st.info("🎉 ¡No tienes errores guardados! Tu banco de errores está vacío.")
+
+    st.header("🔥 Test de más falladas")
+    st.caption(
+        "Las preguntas que más veces has fallado a lo largo del tiempo (acumulado de todos tus tests). "
+        f"Entran a partir de {MIN_FALLOS_MAS_FALLADAS} fallos y salen si aciertas las últimas {RACHA_ACIERTOS_PARA_QUITAR} veces seguidas. "
+        "Distinto del test de rojas, que solo mira el estado actual."
+    )
+    if supabase_client is not None:
+        _rank_sb, _err_rank_sb = calcular_mas_falladas()
+        if _rank_sb:
+            st.caption(f"📌 Tienes **{len(_rank_sb)}** pregunta(s) en tu ranking de más falladas.")
+        elif _err_rank_sb is None:
+            st.caption("📌 Ninguna pregunta cumple todavía las condiciones del ranking.")
+    n_preguntas_falladas = st.number_input(
+        "¿Cuántas de las más falladas quieres?",
+        min_value=1, max_value=500, value=20, step=1,
+        key="n_preguntas_mas_falladas"
+    )
+    if supabase_client is not None and st.button("🔥 Cargar Test de más falladas"):
+        with st.spinner("Buscando tus preguntas más falladas..."):
+            preguntas_ff, plantilla_ff, n_ff, error_ff = cargar_test_mas_falladas(n_preguntas_falladas)
+            if error_ff:
+                st.error(error_ff)
+            elif preguntas_ff:
+                st.session_state.preguntas_examen = preguntas_ff
+                reiniciar_intento()
+                st.session_state.plantilla_respuestas = plantilla_ff
+                st.session_state.modo_test_errores = False
+                st.session_state.modo_test_mixto = False
+                mensaje = f"✅ Test de más falladas con {n_ff} pregunta(s)"
+                if n_ff < n_preguntas_falladas:
+                    mensaje += f" (pediste {n_preguntas_falladas}, pero solo hay {n_ff} que cumplan las condiciones)"
+                st.success(mensaje + ".")
+            else:
+                st.info("🎉 Ninguna pregunta cumple todavía las condiciones del ranking (3 fallos o más y sin 5 aciertos seguidos al final).")
 
     st.header("🔖 Preguntas marcadas")
     st.caption("Marca preguntas con el icono 🔖 mientras las respondes y vuelve a ellas cuando quieras.")
@@ -1599,8 +1705,8 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # --- PANTALLA PRINCIPAL: PESTAÑAS ---
-tab1, tab2, tab_progreso, tab_marcadas, tab3 = st.tabs(
-    ["📝 Cuestionario Interactivo", "💬 Chat con el Examen", "📈 Progreso", "🔖 Marcadas", "🔧 Diagnóstico"]
+tab1, tab2, tab_progreso, tab_falladas, tab_marcadas, tab3 = st.tabs(
+    ["📝 Cuestionario Interactivo", "💬 Chat con el Examen", "📈 Progreso", "🔥 Más falladas", "🔖 Marcadas", "🔧 Diagnóstico"]
 )
 
 with tab1:
@@ -1893,6 +1999,62 @@ with tab_progreso:
                     df_u.columns = ["Verdes", "Rojas"]
                     st.caption("Estado actual de las preguntas según el día de su última práctica")
                     st.bar_chart(df_u, color=COLORES_ESTADO[:2])
+
+with tab_falladas:
+    st.subheader("🔥 Preguntas más falladas")
+    st.caption(
+        "Ranking acumulado de todos tus tests: cuenta cada vez que una pregunta ha salido en rojo "
+        f"(fallada o dejada en blanco). Solo aparecen las que llevan {MIN_FALLOS_MAS_FALLADAS} fallos o más, "
+        f"y desaparecen cuando aciertas sus últimas {RACHA_ACIERTOS_PARA_QUITAR} veces seguidas. "
+        "Despliega una pregunta para verla con sus respuestas."
+    )
+    if supabase_client is None:
+        st.info("Configura SUPABASE_URL y SUPABASE_KEY en tu .env para ver tus preguntas más falladas.")
+    else:
+        if st.button("🔄 Actualizar ranking", key="actualizar_falladas"):
+            _limpiar_caches_dominio()
+            st.rerun()
+
+        ranking_f, error_f = calcular_mas_falladas()
+        if error_f:
+            st.error(f"No se pudo leer 'historial_dominio': {error_f}")
+        elif not ranking_f:
+            st.info("🎉 Ninguna pregunta cumple todavía las condiciones del ranking.")
+        else:
+            n_ver_f = st.number_input(
+                "¿Cuántas quieres ver?", min_value=1, max_value=500, value=50, step=10,
+                key="n_ver_mas_falladas"
+            )
+            mostrar_f = ranking_f[:int(n_ver_f)]
+            st.caption(f"**{len(ranking_f)}** pregunta(s) en el ranking · mostrando las {len(mostrar_f)} más falladas.")
+
+            contenido_f, plantilla_f = _contenido_preguntas_cacheado(tuple((t, n) for t, n, _ in mostrar_f))
+            por_clave_f = {p["clave"]: p for p in contenido_f}
+            estados_f, _err_estados_f = obtener_estados_dominio()
+            estados_f = estados_f or {}
+
+            for pos, (tabla_f, num_f, veces_f) in enumerate(mostrar_f, start=1):
+                it = por_clave_f.get(f"{tabla_f}__{num_f}")
+                titulo_f = f"{pos}. [{tabla_f}] Pregunta {num_f} · fallada {veces_f} {'vez' if veces_f == 1 else 'veces'}"
+                with st.expander(titulo_f):
+                    if it is None:
+                        st.warning("No se encontró el contenido de esta pregunta (quizá se borró de su tabla).")
+                        continue
+                    estado_actual = estados_f.get((tabla_f, num_f), {}).get("estado")
+                    if estado_actual == "rojo":
+                        st.caption("🔴 Ahora mismo está en rojo")
+                    elif estado_actual == "verde":
+                        st.caption("🟢 Ahora mismo está en verde")
+                    c_f = plantilla_f.get(it["clave"])
+                    st.markdown(f"**{it['pregunta']}**")
+                    for opt in it["opciones"]:
+                        letra = str(opt["letra"]).lower()
+                        texto_opt = f"{letra.upper()}) {opt['texto']}"
+                        if c_f and letra == c_f:
+                            st.success(texto_opt, icon="✅")
+                        else:
+                            with st.container(border=True):
+                                st.markdown(texto_opt)
 
 with tab_marcadas:
     st.subheader("🔖 Tus preguntas marcadas")
